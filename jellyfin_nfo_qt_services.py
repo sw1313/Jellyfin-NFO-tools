@@ -4,14 +4,13 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, quote_plus, unquote, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 from PySide6.QtCore import Qt, QTimer
@@ -249,12 +248,6 @@ def _chromium_cookie_source(self) -> str:
     # 使用独立 Chromium 配置目录，避免与系统 Edge/Chrome 运行中的锁冲突。
     return f"chromium:{self._chromium_cookie_profile_name()}"
 
-def _chromium_confirm_marker_prefix(self) -> str:
-    return "https://cursor-yt-confirm.local/ok"
-
-def _chromium_extension_dir(self) -> Path:
-    return Path(__file__).with_name(".chromium_confirm_extension")
-
 def _chromium_profile_dir(self) -> Path:
     return self._chromium_user_data_dir() / self._chromium_cookie_profile_name()
 
@@ -264,32 +257,6 @@ def _chromium_cookie_db_paths(self) -> list[Path]:
         profile_dir / "Cookies",
         profile_dir / "Network" / "Cookies",
     ]
-
-def _clear_chromium_restore_session_files(self):
-    profile_dir = self._chromium_profile_dir()
-    targets = [
-        profile_dir / "Last Session",
-        profile_dir / "Last Tabs",
-        profile_dir / "Current Session",
-        profile_dir / "Current Tabs",
-    ]
-    sessions_dir = profile_dir / "Sessions"
-    try:
-        if sessions_dir.exists():
-            for p in sessions_dir.glob("*"):
-                if p.is_file():
-                    try:
-                        p.unlink()
-                    except Exception:
-                        pass
-    except Exception as exc:
-        self._log(f"[Chromium] 清理 Sessions 目录失败: {exc}")
-    for p in targets:
-        try:
-            if p.exists() and p.is_file():
-                p.unlink()
-        except Exception:
-            pass
 
 def _wait_for_chromium_cookie_db(self, timeout_sec: float = 8.0) -> bool:
     end_at = time.time() + max(0.5, timeout_sec)
@@ -321,104 +288,6 @@ def _wait_for_chromium_cookie_db_copyable(self, timeout_sec: float = 10.0) -> bo
                 pass
         time.sleep(0.25)
     return False
-
-def _opened_youtube_watch_page_since(self, since_unix_ts: float) -> bool:
-    profile_dir = self._chromium_profile_dir()
-    history_db = profile_dir / "History"
-    if not history_db.exists():
-        return False
-    # Chromium History uses WebKit timestamp: microseconds since 1601-01-01.
-    since_webkit = int((since_unix_ts + 11644473600) * 1_000_000)
-    sql = (
-        "SELECT 1 FROM urls "
-        "WHERE url LIKE 'https://www.youtube.com/watch%' "
-        "AND last_visit_time >= ? "
-        "LIMIT 1"
-    )
-    try:
-        con = sqlite3.connect(str(history_db))
-        try:
-            row = con.execute(sql, (since_webkit,)).fetchone()
-            return row is not None
-        finally:
-            con.close()
-    except Exception as exc:
-        self._log(f"[Chromium] 读取 History 失败: {exc}")
-        return False
-
-def _has_chromium_confirm_marker_since(self, since_unix_ts: float) -> bool:
-    profile_dir = self._chromium_profile_dir()
-    history_db = profile_dir / "History"
-    if not history_db.exists():
-        return False
-    since_webkit = int((since_unix_ts + 11644473600) * 1_000_000)
-    sql = (
-        "SELECT 1 FROM urls "
-        "WHERE url LIKE ? "
-        "AND last_visit_time >= ? "
-        "LIMIT 1"
-    )
-    try:
-        con = sqlite3.connect(str(history_db))
-        try:
-            row = con.execute(sql, (f"{self._chromium_confirm_marker_prefix()}%", since_webkit)).fetchone()
-            return row is not None
-        finally:
-            con.close()
-    except Exception as exc:
-        self._log(f"[Chromium] 读取确认标记失败: {exc}")
-        return False
-
-def _latest_confirmed_video_url_since(self, since_unix_ts: float) -> str:
-    profile_dir = self._chromium_profile_dir()
-    history_db = profile_dir / "History"
-    if not history_db.exists():
-        return ""
-    since_webkit = int((since_unix_ts + 11644473600) * 1_000_000)
-    sql = (
-        "SELECT url FROM urls "
-        "WHERE url LIKE ? "
-        "AND last_visit_time >= ? "
-        "ORDER BY last_visit_time DESC "
-        "LIMIT 1"
-    )
-    try:
-        con = sqlite3.connect(str(history_db))
-        try:
-            row = con.execute(sql, (f"{self._chromium_confirm_marker_prefix()}%", since_webkit)).fetchone()
-        finally:
-            con.close()
-    except Exception as exc:
-        self._log(f"[Chromium] 读取确认URL失败: {exc}")
-        return ""
-    if not row or not row[0]:
-        return ""
-    marker_url = str(row[0]).strip()
-    try:
-        q = parse_qs(urlparse(marker_url).query)
-        raw_from = (q.get("from") or [""])[0]
-        src = unquote(raw_from).strip()
-    except Exception:
-        src = ""
-    if not self._is_youtube_url(src):
-        return ""
-    return src
-
-def _close_chromium_process(self, proc: subprocess.Popen | None):
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=8)
-            except Exception:
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-    except Exception:
-        pass
 
 def _ytdlp_js_runtime_args(self) -> list[str]:
     # YouTube n challenge 需要可用 JS runtime；优先使用 Node.js。
@@ -788,136 +657,6 @@ def _download_video_by_ytdlp(
     self._last_ytdlp_error = (err_text or "未知错误")[:800]
     self._log(f"[yt-dlp] 下载失败: {self._last_ytdlp_error}")
     return None
-
-def _ensure_chromium_browser(self) -> tuple[str, str] | None:
-    project_dir = Path(__file__).parent
-    # 优先使用本地路径下的 Chromium（便携放置）。
-    local_candidates = [
-        project_dir / ".chromium" / "chrome.exe",
-        project_dir / ".chromium" / "chrome-win" / "chrome.exe",
-        project_dir / ".chromium" / "chrome-linux" / "chrome",
-        project_dir / ".chromium" / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
-    ]
-    for p in local_candidates:
-        if p.exists():
-            return (str(p), self._chromium_cookie_source())
-
-    # 复用已安装的 Playwright Chromium，避免每次重复安装。
-    local_app = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app:
-        pw_root = Path(local_app) / "ms-playwright"
-        if pw_root.exists():
-            candidates = sorted(
-                [p for p in pw_root.glob("chromium-*/*/chrome.exe") if p.is_file()],
-                key=lambda x: x.stat().st_mtime,
-                reverse=True,
-            )
-            if candidates:
-                picked = str(candidates[0])
-                self._log(f"[Chromium] 复用已安装 Playwright Chromium: {picked}")
-                return (picked, self._chromium_cookie_source())
-
-    # 系统里已有 chromium 时直接使用。
-    for exe_name in ("chromium", "chromium-browser"):
-        p = shutil.which(exe_name)
-        if p:
-            return (p, self._chromium_cookie_source())
-
-    self._log("[Chromium] 未找到可执行文件，开始自动安装 Playwright Chromium...")
-
-    def _run_cmd(cmd: list[str]) -> tuple[int, str, str]:
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-            return (proc.returncode, proc.stdout or "", proc.stderr or "")
-        except Exception as exc:
-            return (-1, "", str(exc))
-
-    rc1, _o1, e1 = _run_cmd([sys.executable, "-m", "pip", "install", "-U", "playwright"])
-    if rc1 != 0:
-        self._log(f"[Chromium] 安装 playwright 失败: {(e1 or 'unknown')[:240]}")
-        return None
-    rc2, _o2, e2 = _run_cmd([sys.executable, "-m", "playwright", "install", "chromium"])
-    if rc2 != 0:
-        self._log(f"[Chromium] 下载 chromium 失败: {(e2 or 'unknown')[:240]}")
-        return None
-    rc3, out3, e3 = _run_cmd(
-        [
-            sys.executable,
-            "-c",
-            "from playwright.sync_api import sync_playwright\n"
-            "p=sync_playwright().start()\n"
-            "print(p.chromium.executable_path)\n"
-            "p.stop()\n",
-        ]
-    )
-    if rc3 != 0:
-        self._log(f"[Chromium] 获取 chromium 路径失败: {(e3 or 'unknown')[:240]}")
-        return None
-    exe = (out3 or "").strip().splitlines()[-1].strip() if (out3 or "").strip() else ""
-    if not exe or not Path(exe).exists():
-        self._log("[Chromium] 自动安装完成但未找到可执行路径。")
-        return None
-    self._log(f"[Chromium] 自动安装成功: {exe}")
-    return (exe, self._chromium_cookie_source())
-
-def _prompt_chromium_login_cookie(self, open_url: str, message: str) -> str | None:
-    found = self._ensure_chromium_browser()
-    if found is None:
-        self._log("[yt-dlp] 未准备好 Chromium，无法执行登录重试。")
-        return None
-    browser_path, cookie_source = found
-    user_data_dir = self._chromium_user_data_dir()
-    user_data_dir.mkdir(parents=True, exist_ok=True)
-    args = [
-        browser_path,
-        "--new-window",
-        f"--user-data-dir={str(user_data_dir)}",
-        f"--profile-directory={self._chromium_cookie_profile_name()}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-sync",
-        "--disable-features=SigninIntercept,SignInPromo,Sync",
-        open_url,
-    ]
-    proc = None
-    try:
-        proc = subprocess.Popen(args)
-    except Exception as exc:
-        self._log(f"[yt-dlp] 启动浏览器登录失败: {exc}")
-        return None
-    msg_box = QMessageBox(self)
-    msg_box.setIcon(QMessageBox.Icon.Question)
-    msg_box.setWindowTitle("需要登录 YouTube")
-    msg_box.setText(message)
-    continue_btn = msg_box.addButton("继续", QMessageBox.ButtonRole.AcceptRole)
-    msg_box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
-    msg_box.exec()
-    if msg_box.clickedButton() is not continue_btn:
-        self._log("[yt-dlp] 用户取消登录重试。")
-        return None
-    self._log("[yt-dlp] 用户点击应用，开始关闭 Chromium 并等待 Cookie 落盘。")
-    self._close_chromium_process(proc)
-    if not self._wait_for_chromium_cookie_db(timeout_sec=10.0):
-        self._log("[yt-dlp] 未检测到 Chromium Cookies 数据库，稍后重试。")
-        QMessageBox.warning(self, "Cookie 未就绪", "未检测到 Chromium cookie 数据库，请确认已登录后重试。")
-        return None
-    return cookie_source
-
-def _retry_ytdlp_with_browser_login(self, video_url: str, target_key: str) -> Path | None:
-    cookie_source = self._prompt_chromium_login_cookie(
-        video_url,
-        "请在已打开的 Chromium 窗口完成登录。\n登录完成后点击“应用”继续下载（将自动使用 Chromium Cookies）。",
-    )
-    if not cookie_source:
-        return None
-    return self._download_video_by_ytdlp(video_url, target_key, cookie_source=cookie_source)
-
-def _prompt_chromium_login_for_search(self, keyword: str) -> str | None:
-    search_url = f"https://www.youtube.com/results?search_query={quote_plus(keyword)}"
-    return self._prompt_chromium_login_cookie(
-        search_url,
-        "搜索需要登录。请在已打开的 WebView2 窗口完成登录。\n登录完成后点击“确认并继续”（将自动使用登录 Cookies）。",
-    )
 
 def _prompt_chromium_login_cookie_async(self, open_url: str, message: str, on_done, require_watch_page: bool = False):
     self._last_confirmed_video_url = ""
@@ -2298,27 +2037,16 @@ def bind_network_services_methods(cls):
     cls._chromium_cookie_profile_name = _chromium_cookie_profile_name
     cls._chromium_user_data_dir = _chromium_user_data_dir
     cls._chromium_cookie_source = _chromium_cookie_source
-    cls._chromium_confirm_marker_prefix = _chromium_confirm_marker_prefix
-    cls._chromium_extension_dir = _chromium_extension_dir
     cls._chromium_profile_dir = _chromium_profile_dir
     cls._chromium_cookie_db_paths = _chromium_cookie_db_paths
-    cls._clear_chromium_restore_session_files = _clear_chromium_restore_session_files
     cls._wait_for_chromium_cookie_db = _wait_for_chromium_cookie_db
     cls._wait_for_chromium_cookie_db_copyable = _wait_for_chromium_cookie_db_copyable
-    cls._opened_youtube_watch_page_since = _opened_youtube_watch_page_since
-    cls._has_chromium_confirm_marker_since = _has_chromium_confirm_marker_since
-    cls._latest_confirmed_video_url_since = _latest_confirmed_video_url_since
-    cls._close_chromium_process = _close_chromium_process
     cls._ytdlp_js_runtime_args = _ytdlp_js_runtime_args
     cls._ytdlp_impersonate_args = _ytdlp_impersonate_args
     cls._ytdlp_cmd_prefix = _ytdlp_cmd_prefix
     cls._ytdlp_subprocess_env = _ytdlp_subprocess_env
     cls._pick_best_ytdlp_format = _pick_best_ytdlp_format
     cls._download_video_by_ytdlp = _download_video_by_ytdlp
-    cls._ensure_chromium_browser = _ensure_chromium_browser
-    cls._prompt_chromium_login_cookie = _prompt_chromium_login_cookie
-    cls._retry_ytdlp_with_browser_login = _retry_ytdlp_with_browser_login
-    cls._prompt_chromium_login_for_search = _prompt_chromium_login_for_search
     cls._prompt_chromium_login_cookie_async = _prompt_chromium_login_cookie_async
     cls._prompt_chromium_login_for_search_async = _prompt_chromium_login_for_search_async
     cls._search_youtube_candidates = _search_youtube_candidates

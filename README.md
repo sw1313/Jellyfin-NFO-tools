@@ -94,16 +94,7 @@ pip install pillow
 pip install pywebview
 ```
 
-#### F. Chromium 自动安装链路（playwright）
-
-部分登录/cookie 相关流程会尝试自动安装 Chromium，建议提前安装：
-
-```powershell
-pip install -U playwright
-python -m playwright install chromium
-```
-
-#### G.（仅 `season_renamer_ui.py` 独立运行时）拖拽增强
+#### F.（仅 `season_renamer_ui.py` 独立运行时）拖拽增强
 
 - `windnd`：仅用于 Tk 版季重命名工具的拖拽输入（主 Qt 程序不依赖）
 
@@ -118,8 +109,7 @@ pip install windnd
 ### 3.1 安装依赖（推荐完整版）
 
 ```powershell
-pip install -U pyside6 yt-dlp pillow pywebview playwright
-python -m playwright install chromium
+pip install -U pyside6 yt-dlp pillow pywebview
 ```
 
 并确保：
@@ -231,13 +221,12 @@ pip install -U yt-dlp
 
 通常是缺少 `ffmpeg`，请安装并加入 `PATH`。
 
-### Q4: 登录流程异常（WebView2/Chromium）
+### Q4: 登录流程异常（WebView2）
 
 请先安装：
 
 ```powershell
-pip install pywebview playwright
-python -m playwright install chromium
+pip install pywebview
 ```
 
 ### Q5: 可以删除 `season_renamer_ui.py` 吗？
