@@ -5,7 +5,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from PySide6.QtCore import QPoint, QRect, QRectF, QSize, QTimer, Qt, QUrl, Signal, QEvent
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QRegion
@@ -375,16 +375,31 @@ def _detect_url_media_kind(url: str) -> str:
     txt = str(url or "").strip()
     if not txt:
         return "image"
-    path = urlsplit(txt).path
+    parsed = urlsplit(txt)
+    path = parsed.path
     suf = Path(path).suffix.lower()
     if suf in VIDEO_EXTS:
         return "video"
     if suf in _IMAGE_EXTS:
         return "image"
+    query = {k.lower(): v for k, v in parse_qs(parsed.query or "").items()}
+    fmt = ((query.get("format") or [""])[0] or "").strip().lower()
+    if fmt:
+        if not fmt.startswith("."):
+            fmt = f".{fmt}"
+        if fmt in _IMAGE_EXTS:
+            return "image"
+        if fmt in VIDEO_EXTS:
+            return "video"
     lower = txt.lower()
+    host = (parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host in {"pbs.twimg.com", "images.unsplash.com", "i.imgur.com"}:
+        return "image"
     if any(k in lower for k in ("youtube.com", "youtu.be", "twitter.com", "x.com", "bilibili.com")):
         return "video"
-    return "video"
+    return "image"
 
 
 def _pick_video_for_image_target(self, target_key: str, is_extra: bool):
@@ -397,38 +412,13 @@ def _pick_video_for_image_target(self, target_key: str, is_extra: bool):
     edit.set_paths([str(p)])
 
 
-def _open_video_url_for_image_target(self, target_key: str, is_extra: bool):
-    edit = _image_target_edit(self, target_key, is_extra)
-    if edit is None:
-        return
-    url, ok = QInputDialog.getText(self, "输入链接", "视频链接（http/https）")
-    if not ok or not str(url or "").strip():
-        return
-
-    def _job():
-        return self._download_binary_from_url(url, target_key, kind="video", show_dialog=False)
-
-    def _done(path_obj, err):
-        if err:
-            QMessageBox.critical(self, "下载失败", str(err))
-            return
+def _download_url_for_image_target(self, edit, target_key: str, url: str, kind: str):
+    def _apply_path(path_obj):
         path = path_obj if isinstance(path_obj, Path) else None
         if path is None:
-            QMessageBox.warning(self, "下载失败", "视频下载失败，请查看日志。")
+            QMessageBox.warning(self, "下载失败", "下载失败，请查看日志。")
             return
         edit.set_paths([str(path)])
-
-    self._run_async(_job, _done)
-
-
-def _open_media_url_for_image_target(self, target_key: str, is_extra: bool):
-    edit = _image_target_edit(self, target_key, is_extra)
-    if edit is None:
-        return
-    url, ok = QInputDialog.getText(self, "输入链接", "图片/视频链接（http/https）")
-    if not ok or not str(url or "").strip():
-        return
-    kind = _detect_url_media_kind(url)
 
     def _job():
         if kind == "image":
@@ -440,12 +430,62 @@ def _open_media_url_for_image_target(self, target_key: str, is_extra: bool):
             QMessageBox.critical(self, "下载失败", str(err))
             return
         path = path_obj if isinstance(path_obj, Path) else None
-        if path is None:
-            QMessageBox.warning(self, "下载失败", "下载失败，请查看日志。")
+        if path is not None:
+            edit.set_paths([str(path)])
             return
-        edit.set_paths([str(path)])
+        normalized_video_url = self._normalize_video_download_url(url) if kind == "video" else url
+        if (
+            kind == "video"
+            and self._last_ytdlp_need_cookie
+            and (self._is_youtube_url(normalized_video_url) or self._is_twitter_url(normalized_video_url))
+        ):
+            login_tip = (
+                "请在已打开的 WebView2 窗口完成登录。\n登录完成后点击“确认并继续”（将自动使用登录 Cookies）。"
+            )
+            if self._is_twitter_url(normalized_video_url):
+                login_tip = (
+                    "请在已打开的 WebView2 窗口登录 X/Twitter 账号。\n"
+                    "登录完成后点击“确认并继续”（将自动使用登录 Cookies）。"
+                )
+            self._prompt_chromium_login_cookie_async(
+                normalized_video_url,
+                login_tip,
+                lambda retry_cookie: self._run_async(
+                    lambda: self._download_video_by_ytdlp(normalized_video_url, target_key, cookie_source=retry_cookie),
+                    lambda retry_path_obj, retry_err: (
+                        QMessageBox.critical(self, "下载失败", str(retry_err))
+                        if retry_err
+                        else _apply_path(retry_path_obj)
+                    ),
+                )
+                if retry_cookie
+                else None,
+            )
+            return
+        QMessageBox.warning(self, "下载失败", "下载失败，请查看日志。")
 
     self._run_async(_job, _done)
+
+
+def _open_video_url_for_image_target(self, target_key: str, is_extra: bool):
+    edit = _image_target_edit(self, target_key, is_extra)
+    if edit is None:
+        return
+    url, ok = QInputDialog.getText(self, "输入链接", "视频链接（http/https）")
+    if not ok or not str(url or "").strip():
+        return
+    _download_url_for_image_target(self, edit, target_key, str(url), "video")
+
+
+def _open_media_url_for_image_target(self, target_key: str, is_extra: bool):
+    edit = _image_target_edit(self, target_key, is_extra)
+    if edit is None:
+        return
+    url, ok = QInputDialog.getText(self, "输入链接", "图片/视频链接（http/https）")
+    if not ok or not str(url or "").strip():
+        return
+    kind = _detect_url_media_kind(url)
+    _download_url_for_image_target(self, edit, target_key, str(url), kind)
 
 
 def _open_video_editor_for_image_target(self, target_key: str, is_extra: bool):
@@ -1647,12 +1687,12 @@ def _open_video_segment_dialog(self, videos: list[Path], out_edit: object | None
         rw, rh = _resolution_values()
         vf_chain: list[str] = []
         if vf:
-            vf_chain.append(vf.replace("crop=", "", 1))
+            vf_chain.append(vf)
         vf_chain.append(f"scale={rw}:{rh}:flags=lanczos")
         st, ed = range_slider.values()
         cache_dir = Path(__file__).with_name(".nfo_video_cache")
         cache_dir.mkdir(parents=True, exist_ok=True)
-        apng_out = cache_dir / f"{selected_video.stem}_clip.apng"
+        apng_out = cache_dir / f"{selected_video.stem}_clip.png"
         try:
             apng_out.unlink(missing_ok=True)
         except Exception:
@@ -1660,6 +1700,9 @@ def _open_video_segment_dialog(self, videos: list[Path], out_edit: object | None
         cmd = [
             "ffmpeg",
             "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-ss",
             f"{max(0.0, st / 1000.0):.3f}",
             "-to",
@@ -1669,6 +1712,8 @@ def _open_video_segment_dialog(self, videos: list[Path], out_edit: object | None
             "-an",
             "-vf",
             ",".join(vf_chain),
+            "-c:v",
+            "apng",
             "-plays",
             "0",
             "-f",
@@ -1681,7 +1726,7 @@ def _open_video_segment_dialog(self, videos: list[Path], out_edit: object | None
             QMessageBox.critical(dlg, "转换失败", str(exc))
             return
         if proc.returncode != 0 or (not apng_out.exists()):
-            err = (proc.stderr or "").strip()[:500]
+            err = ((proc.stderr or "").strip() or (proc.stdout or "").strip())[:1200]
             QMessageBox.critical(dlg, "转换失败", err or "ffmpeg 执行失败")
             return
         try:
