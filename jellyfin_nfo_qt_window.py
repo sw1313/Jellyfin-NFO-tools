@@ -1326,6 +1326,8 @@ class PathListWidget(QWidget):
         self._async_image_workers: set[_AsyncWorker] = set()
         self._image_has_video_cards = False
         self._layout_rows = 1
+        self._last_image_col_count = 0
+        self._rebuild_scheduled = False
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1360,9 +1362,14 @@ class PathListWidget(QWidget):
                 continue
             seen.add(key)
             cleaned.append(str(Path(txt)))
+        if cleaned == self._paths:
+            if self._selected:
+                self._selected.clear()
+                self._refresh_selected_styles()
+            return
         self._paths = cleaned
         self._selected.clear()
-        self._rebuild_cards()
+        self._schedule_rebuild_cards()
 
     def get_paths(self) -> list[str]:
         return [x for x in self._paths if x.strip()]
@@ -1383,14 +1390,14 @@ class PathListWidget(QWidget):
         if norm in {self._norm(x) for x in self._paths}:
             return
         self._paths.append(str(Path(path)))
-        self._rebuild_cards()
+        self._schedule_rebuild_cards()
 
     def remove_selected(self):
         if not self._selected:
             return
         self._paths = [p for p in self._paths if self._norm(p) not in self._selected]
         self._selected.clear()
-        self._rebuild_cards()
+        self._schedule_rebuild_cards()
 
     def stop_all_media(self):
         # 释放预览播放器占用，避免写入阶段删除/覆盖媒体文件失败（WinError 32/5）
@@ -1586,11 +1593,12 @@ class PathListWidget(QWidget):
         ratio = self._image_ratio_cache.get(key)
         if ratio is None:
             try:
-                pix = QPixmap(str(path))
-                if pix.isNull() or pix.height() <= 0:
+                reader = QImageReader(str(path))
+                sz = reader.size()
+                if (not sz.isValid()) or sz.height() <= 0:
                     ratio = 1.0
                 else:
-                    ratio = float(pix.width()) / float(pix.height())
+                    ratio = float(sz.width()) / float(sz.height())
             except Exception:
                 ratio = 1.0
             self._image_ratio_cache[key] = ratio
@@ -1783,6 +1791,7 @@ class PathListWidget(QWidget):
         open_btn.clicked.connect(lambda: self._open_path(self._norm(str(path))))
 
     def _rebuild_cards(self):
+        self._rebuild_scheduled = False
         # 先停止并释放旧播放器，避免网络文件句柄残留导致后续删除/覆盖失败。
         for player in self._players:
             try:
@@ -1811,6 +1820,7 @@ class PathListWidget(QWidget):
 
         if self.media_kind == "image":
             col_count = self._image_col_count()
+            self._last_image_col_count = col_count
             for c in range(col_count):
                 self.grid.setColumnStretch(c, 1)
             row = 0
@@ -1916,10 +1926,19 @@ class PathListWidget(QWidget):
         self.setMinimumHeight(h)
         self.setMaximumHeight(h)
 
+    def _schedule_rebuild_cards(self, delay_ms: int = 0):
+        if self._rebuild_scheduled:
+            return
+        self._rebuild_scheduled = True
+        QTimer.singleShot(max(0, int(delay_ms)), self._rebuild_cards)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        if self.media_kind in {"image", "video"}:
-            self._rebuild_cards()
+        if self.media_kind != "image":
+            return
+        col_count = self._image_col_count()
+        if col_count != int(getattr(self, "_last_image_col_count", 0)):
+            self._schedule_rebuild_cards(0)
 
 
 class FlowLayout(QLayout):
@@ -2517,7 +2536,8 @@ class JellyfinNfoQtWindow(QMainWindow):
         self._session_pg_error_logged = False
         self._auto_load_timer = QTimer(self)
         self._auto_load_timer.setSingleShot(True)
-        self._auto_load_timer.timeout.connect(lambda: self.load_selected_metadata(silent_if_empty=True))
+        # 选择恢复到同一路径时也要强制重载；否则右侧媒体区可能残留上次未写入的缓存预览（如 *_clip.png）。
+        self._auto_load_timer.timeout.connect(lambda: self.load_selected_metadata(silent_if_empty=True, force_reload=True))
         self._session_save_timer = QTimer(self)
         self._session_save_timer.setSingleShot(True)
         self._session_save_timer.timeout.connect(self._save_ui_session)
