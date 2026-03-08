@@ -478,6 +478,9 @@ def build_ui(window):
         if tag == "plot":
             edit = QTextEdit()
             edit.setMinimumHeight(120)
+            # `plot` 需要允许手工编辑 HTML 源码；否则 QTextEdit 会把粘贴的 HTML 当富文本渲染，
+            # 后续 `toPlainText()` 保存时会吞掉 `<br>`/`<a>` 等标记。
+            edit.setAcceptRichText(False)
             window.plot_edit = edit
             nfo_grid.addWidget(edit, row, 1, 1, 3)
         elif tag == "title":
