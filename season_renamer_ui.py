@@ -90,9 +90,26 @@ def group_by_season(files: set[Path]) -> dict[int, list[Path]]:
     return grouped
 
 
+def _find_same_stem_nfo(src: Path) -> Path | None:
+    parent = src.parent
+    wanted_stem = src.stem.casefold()
+    try:
+        for child in parent.iterdir():
+            if not child.is_file():
+                continue
+            if child.suffix.lower() != ".nfo":
+                continue
+            if child.stem.casefold() == wanted_stem:
+                return child
+    except Exception:
+        return None
+    return None
+
+
 def build_rename_ops(grouped: dict[int, list[Path]]) -> tuple[list[RenameOp], list[str]]:
     ops: list[RenameOp] = []
     skipped_msgs: list[str] = []
+    planned_sources: set[Path] = set()
     for season_num, files in grouped.items():
         max_existing_ep = 0
         pending_files: list[Path] = []
@@ -119,7 +136,16 @@ def build_rename_ops(grouped: dict[int, list[Path]]) -> tuple[list[RenameOp], li
             suffix = f" S{season_num:02d}E{next_ep:0{ep_width}d}"
             new_stem = build_stem_with_limit(src.stem, suffix, src.suffix)
             dst = src.with_name(f"{new_stem}{src.suffix}")
-            ops.append(RenameOp(source=src, target=dst))
+            src_resolved = src.resolve()
+            if src_resolved not in planned_sources:
+                ops.append(RenameOp(source=src, target=dst))
+                planned_sources.add(src_resolved)
+            same_nfo = _find_same_stem_nfo(src)
+            if same_nfo is not None:
+                nfo_resolved = same_nfo.resolve()
+                if nfo_resolved not in planned_sources:
+                    ops.append(RenameOp(source=same_nfo, target=same_nfo.with_name(f"{new_stem}{same_nfo.suffix}")))
+                    planned_sources.add(nfo_resolved)
             next_ep += 1
     return ops, skipped_msgs
 
