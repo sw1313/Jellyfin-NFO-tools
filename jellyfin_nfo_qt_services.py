@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import locale
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -45,6 +48,19 @@ from season_renamer_ui import (
 )
 
 SUPPORTED_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif"}
+
+
+def _decode_subprocess_text(raw: bytes) -> str:
+    if not raw:
+        return ""
+    for enc in ("utf-8", "gb18030", locale.getpreferredencoding(False) or "", "cp936"):
+        if not enc:
+            continue
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 def _download_image_from_url(
     self,
@@ -123,7 +139,10 @@ def _download_binary_from_url(self, raw_url: str, target_name: str, kind: str, s
     if kind == "video":
         # 视频链接统一优先走 yt-dlp：支持 YouTube/Twitter(X) 等页面链接；
         # 若 yt-dlp 失败，再回退到直链下载，兼容直接 mp4/webm 地址。
-        ytdlp_path = self._download_video_by_ytdlp(url, target_name)
+        cookie_source = _default_cookie_source_for_video(self, url)
+        if cookie_source:
+            self._log("[yt-dlp] 检测到已登录 Chromium Cookies，首轮优先使用 --cookies-from-browser。")
+        ytdlp_path = self._download_video_by_ytdlp(url, target_name, cookie_source=cookie_source)
         if ytdlp_path is not None:
             return ytdlp_path
     try:
@@ -289,6 +308,34 @@ def _wait_for_chromium_cookie_db_copyable(self, timeout_sec: float = 10.0) -> bo
         time.sleep(0.25)
     return False
 
+def _chromium_cookie_db_copyable_now(self) -> bool:
+    """非阻塞探测 cookies 数据库是否已存在且当前可复制。"""
+    for p in self._chromium_cookie_db_paths():
+        if not p.exists():
+            continue
+        probe = p.with_name(p.name + ".copy_probe")
+        try:
+            shutil.copy2(p, probe)
+            try:
+                probe.unlink()
+            except Exception:
+                pass
+            return True
+        except Exception:
+            pass
+    return False
+
+def _default_cookie_source_for_video(self, url: str) -> str | None:
+    """YouTube/Twitter 首次下载优先复用已有 Chromium 登录 cookies。"""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    if (not self._is_youtube_url(raw)) and (not self._is_twitter_url(raw)):
+        return None
+    if not _chromium_cookie_db_copyable_now(self):
+        return None
+    return self._chromium_cookie_source()
+
 def _ytdlp_js_runtime_args(self) -> list[str]:
     # YouTube n challenge 需要可用 JS runtime；优先使用 Node.js。
     node_bin = shutil.which("node")
@@ -340,6 +387,171 @@ def _ytdlp_subprocess_env(self) -> dict[str, str]:
         if node_dir.lower() not in path_val.lower():
             env["PATH"] = f"{node_dir}{os.pathsep}{path_val}" if path_val else node_dir
     return env
+
+def _ytdlp_archive_path(base_dir: Path) -> Path:
+    base = Path(base_dir).resolve()
+    base.mkdir(parents=True, exist_ok=True)
+    return base / ".yt-dlp-archive.txt"
+
+# --------------- bgutil PO Token 服务自动管理 ---------------
+_POT_SERVER_PORT = 4416
+_POT_SERVER_URL = f"http://127.0.0.1:{_POT_SERVER_PORT}"
+_POT_REPO = "https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git"
+
+def _find_node_bin() -> str | None:
+    nb = shutil.which("node")
+    if nb:
+        return nb
+    win_default = Path(r"C:\Program Files\nodejs\node.exe")
+    if win_default.exists():
+        return str(win_default)
+    return None
+
+def _find_npm_bin() -> str | None:
+    nb = shutil.which("npm")
+    if nb:
+        return nb
+    node = _find_node_bin()
+    if node:
+        candidate = Path(node).with_name("npm.cmd" if sys.platform == "win32" else "npm")
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+def _pot_server_dir() -> Path:
+    return Path(__file__).with_name(".bgutil_pot_server")
+
+def _pot_server_main_js() -> Path:
+    return _pot_server_dir() / "server" / "build" / "main.js"
+
+def _pot_server_running() -> bool:
+    from urllib.request import urlopen as _urlopen
+    try:
+        resp = _urlopen(f"{_POT_SERVER_URL}/ping", timeout=3)
+        return resp.status == 200
+    except Exception:
+        return False
+
+def _ensure_pot_server(self) -> bool:
+    """确保 bgutil PO Token HTTP 服务运行中；未安装时自动 clone + build + 启动。"""
+    if _pot_server_running():
+        return True
+
+    node_bin = _find_node_bin()
+    if not node_bin:
+        self._log("[yt-dlp] 未找到 Node.js(>=20)，无法启动 PO Token 服务。")
+        return False
+
+    main_js = _pot_server_main_js()
+    if not main_js.exists():
+        git_bin = shutil.which("git")
+        npm_bin = _find_npm_bin()
+        missing = [x for x, b in [("git", git_bin), ("npm", npm_bin)] if not b]
+        if missing:
+            self._log(f"[yt-dlp] 自动安装 PO Token 服务需要 {', '.join(missing)}，请先安装。")
+            return False
+        pot_dir = _pot_server_dir()
+        server_dir = pot_dir / "server"
+        self._log("[yt-dlp] [POT] 首次使用，正在自动安装 PO Token 服务…")
+        try:
+            if pot_dir.exists():
+                shutil.rmtree(pot_dir, ignore_errors=True)
+            self._log("[yt-dlp] [POT] 从 GitHub 克隆仓库…")
+            subprocess.run(
+                [git_bin, "clone", "--depth", "1", _POT_REPO, str(pot_dir)],
+                check=True, capture_output=True, timeout=180,
+            )
+            self._log("[yt-dlp] [POT] 安装 npm 依赖（约 1-2 分钟）…")
+            npm_env = {**os.environ, "npm_config_loglevel": "error"}
+            npm_cache = pot_dir / ".npm_cache"
+            npm_cache.mkdir(parents=True, exist_ok=True)
+            npm_env["npm_config_cache"] = str(npm_cache)
+            subprocess.run(
+                [npm_bin, "install"], cwd=str(server_dir),
+                check=True, capture_output=True, timeout=600,
+                env=npm_env,
+            )
+            npx_bin = shutil.which("npx")
+            if not npx_bin:
+                npx_name = "npx.cmd" if sys.platform == "win32" else "npx"
+                npx_bin = str(Path(npm_bin).with_name(npx_name))
+            self._log("[yt-dlp] [POT] 编译 TypeScript…")
+            subprocess.run(
+                [npx_bin, "tsc"], cwd=str(server_dir),
+                check=True, capture_output=True, timeout=120,
+            )
+            self._log("[yt-dlp] [POT] 安装完成。")
+        except subprocess.CalledProcessError as exc:
+            err = (exc.stderr or b"") if isinstance(exc.stderr, bytes) else (exc.stderr or "").encode()
+            self._log(f"[yt-dlp] [POT] 安装失败: {err.decode('utf-8', errors='replace')[:500]}")
+            return False
+        except Exception as exc:
+            self._log(f"[yt-dlp] [POT] 安装异常: {exc}")
+            return False
+
+    if not main_js.exists():
+        self._log("[yt-dlp] [POT] 编译产物未找到，安装可能不完整。")
+        return False
+
+    self._ensure_pot_plugin_upgraded()
+
+    self._log("[yt-dlp] [POT] 正在启动服务…")
+    try:
+        flags = 0
+        if sys.platform == "win32":
+            flags = subprocess.CREATE_NO_WINDOW
+        proc = subprocess.Popen(
+            [node_bin, str(main_js)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            creationflags=flags,
+            env=self._ytdlp_subprocess_env(),
+        )
+        self._pot_server_proc = proc
+        import atexit
+        atexit.register(lambda: proc.kill() if proc.poll() is None else None)
+        for _ in range(30):
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                err = (proc.stderr.read() or b"").decode("utf-8", errors="replace")
+                self._log(f"[yt-dlp] [POT] 服务意外退出: {err[:400]}")
+                return False
+            if _pot_server_running():
+                self._log("[yt-dlp] [POT] 服务已启动 (端口 4416)。")
+                self._sync_pot_plugin_version()
+                return True
+        self._log("[yt-dlp] [POT] 启动超时(15s)，放弃。")
+        proc.kill()
+        return False
+    except Exception as exc:
+        self._log(f"[yt-dlp] [POT] 启动失败: {exc}")
+        return False
+
+_pot_plugin_upgraded = False
+
+def _ensure_pot_plugin_upgraded(self):
+    """首次启动时用 pip 升级 bgutil-ytdlp-pot-provider 插件到最新版。"""
+    global _pot_plugin_upgraded
+    if _pot_plugin_upgraded:
+        return
+    _pot_plugin_upgraded = True
+    try:
+        self._log("[yt-dlp] [POT] 同步 yt-dlp 插件版本…")
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-U", "bgutil-ytdlp-pot-provider"],
+            capture_output=True, text=True, check=False, timeout=120,
+        )
+        out = (r.stdout or "").strip()
+        if "Successfully installed" in out:
+            ver = out.split("bgutil-ytdlp-pot-provider-")[-1].split()[0] if "bgutil-ytdlp-pot-provider-" in out else "latest"
+            self._log(f"[yt-dlp] [POT] 插件已升级到 {ver}。")
+        else:
+            self._log("[yt-dlp] [POT] 插件已是最新版本。")
+    except Exception as exc:
+        self._log(f"[yt-dlp] [POT] 插件升级跳过: {exc}")
+
+def _sync_pot_plugin_version(self):
+    """服务启动后检查插件/服务版本是否一致，不一致则升级。"""
+    self._ensure_pot_plugin_upgraded()
 
 def _pick_best_ytdlp_format(self, cmd_prefix: list[str], url: str, cookie_source: str | None = None) -> str:
     if not cmd_prefix:
@@ -459,6 +671,8 @@ def _download_video_by_ytdlp(
     self._last_ytdlp_error = ""
     self._last_ytdlp_need_cookie = False
     self._last_ytdlp_age_restricted = False
+    if self._is_youtube_url(url):
+        self._ensure_pot_server()
     cmd_prefix = self._ytdlp_cmd_prefix()
     if not cmd_prefix:
         self._last_ytdlp_error = "未找到 yt-dlp，请先安装并加入 PATH。"
@@ -466,6 +680,7 @@ def _download_video_by_ytdlp(
         return None
     cache_dir = Path(__file__).with_name(".nfo_video_cache")
     cache_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = _ytdlp_archive_path(cache_dir)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_tpl = str((cache_dir / f"{target_name}_ytdlp_{ts}.%(ext)s").resolve())
     has_ffmpeg = ffmpeg_available()
@@ -477,7 +692,6 @@ def _download_video_by_ytdlp(
         "--print",
         "after_move:filepath",
         "--quiet",
-        "--force-overwrites",
         "--retries",
         "8",
         "--fragment-retries",
@@ -486,6 +700,8 @@ def _download_video_by_ytdlp(
         "8",
         "--throttled-rate",
         "250K",
+        "--download-archive",
+        str(archive_path),
         "-o",
         out_tpl,
     ]
@@ -524,8 +740,16 @@ def _download_video_by_ytdlp(
             reverse=True,
         )
         for one in candidates:
-            if one.is_file():
-                return one.resolve()
+            if not one.is_file():
+                continue
+            # 仅回收真正的视频下载结果；排除视频裁切/APNG 预览等派生缓存文件。
+            if one.stem.lower().endswith("_clip"):
+                continue
+            if one.suffix.lower() not in VIDEO_EXTS:
+                continue
+            if one.stat().st_mtime < (time.time() - 3600 * 24):
+                continue
+            return one.resolve()
         return None
 
     def _run(one_cmd: list[str]) -> tuple[int, str, str]:
@@ -582,8 +806,12 @@ def _download_video_by_ytdlp(
         # X/Twitter 只做一次默认尝试；失败直接按“需登录”路径处理。
         format_candidates = [""]
     elif self._is_youtube_url(use_url):
-        # YouTube 只做一次：优先自动选定格式；无自动格式则默认自动。
-        format_candidates = [auto_fmt] if auto_fmt else [""]
+        # YouTube: 优先自动选定格式 → 通用 best 组合 → 纯 auto 回退
+        if auto_fmt:
+            format_candidates.append(auto_fmt)
+        if has_ffmpeg:
+            format_candidates.append("bestvideo*+bestaudio/best")
+        format_candidates.append("")
     else:
         if auto_fmt:
             format_candidates.append(auto_fmt)
@@ -592,7 +820,7 @@ def _download_video_by_ytdlp(
                 "bestvideo*+bestaudio/best",
                 "bv*+ba/b",
             ])
-        format_candidates.extend(["", "best", "b"])
+        format_candidates.extend(["", "b"])
     seen: set[str] = set()
     format_candidates = [f for f in format_candidates if (f not in seen and not seen.add(f))]
     last_err = ""
@@ -675,6 +903,11 @@ def _prompt_chromium_login_cookie_async(self, open_url: str, message: str, on_do
         proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
         out = (proc.stdout or "").strip()
         err = (proc.stderr or "").strip()
+        if err:
+            for ln in err.splitlines():
+                s = ln.strip()
+                if s:
+                    self._log(f"[WebView2] {s}")
         if proc.returncode != 0:
             return ("error", (err or out or "WebView2 helper 启动失败").strip())
         last = ""
@@ -1017,6 +1250,12 @@ def _download_youtube_to_output_dir_by_ytdlp(
 ) -> list[Path]:
     self._last_ytdlp_error = ""
     self._last_ytdlp_need_cookie = False
+    if not cookie_source:
+        cookie_source = _default_cookie_source_for_video(self, url)
+        if cookie_source:
+            self._log("[yt-dlp] 检测到已登录 Chromium Cookies，首轮优先使用 --cookies-from-browser。")
+    if self._is_youtube_url(url):
+        self._ensure_pot_server()
     cmd_prefix = self._ytdlp_cmd_prefix()
     if not cmd_prefix:
         self._last_ytdlp_error = "未找到 yt-dlp，请先安装并加入 PATH。"
@@ -1028,16 +1267,20 @@ def _download_youtube_to_output_dir_by_ytdlp(
     root_title_clean = re.sub(r'[\\/:*?"<>|]+', "", str(root_title or "").strip())
     if not root_title_clean:
         root_title_clean = "未命名"
+    # Windows/Linux 文件名最大约 255 字符，模板其余部分约 214 字符，故 root 从末尾截断
+    MAX_FILENAME_LEN = 255
+    tpl_fixed_len = 214  # "[][YYYY-MM-DD] " + title(180) + " [id]." + ext 等
+    if len(root_title_clean) > max(0, MAX_FILENAME_LEN - tpl_fixed_len):
+        root_title_clean = root_title_clean[: MAX_FILENAME_LEN - tpl_fixed_len]
+    archive_path = _ytdlp_archive_path(output_dir)
     out_tpl = str((output_dir / f"[{root_title_clean}][%(upload_date>%Y-%m-%d)s] %(title).180B [%(id)s].%(ext)s").resolve())
     start_ts = time.time()
     base_cmd = [
         *cmd_prefix,
         "--print",
         "after_move:filepath",
-        "--quiet",
         "--embed-metadata",
         "--embed-thumbnail",
-        "--force-overwrites",
         "--retries",
         "8",
         "--fragment-retries",
@@ -1046,12 +1289,25 @@ def _download_youtube_to_output_dir_by_ytdlp(
         "8",
         "--throttled-rate",
         "250K",
+        "--download-archive",
+        str(archive_path),
         "-o",
         out_tpl,
     ]
     if allow_playlist:
-        base_cmd.extend(["--yes-playlist", "--ignore-errors", "--no-abort-on-error"])
+        base_cmd.extend([
+            "--yes-playlist",
+            "--ignore-errors",
+            "--no-abort-on-error",
+            "--newline",
+            "--sleep-requests", "5",
+            "--sleep-interval", "5",
+            "--max-sleep-interval", "10",
+            "--print",
+            "before_dl:__YT_START__:%(title)s [%(id)s]",
+        ])
     else:
+        base_cmd.append("--quiet")
         base_cmd.append("--no-playlist")
     aria2_bin = shutil.which("aria2c")
     if aria2_bin:
@@ -1067,26 +1323,196 @@ def _download_youtube_to_output_dir_by_ytdlp(
         base_cmd.extend(["--merge-output-format", "mp4", "--remux-video", "mp4"])
     base_cmd.extend(self._ytdlp_js_runtime_args())
     base_cmd.extend(self._ytdlp_impersonate_args())
+    if has_ffmpeg:
+        base_cmd.extend(["-f", "bestvideo*+bestaudio/best"])
     use_url = self._normalize_video_download_url(url) or (url or "").strip()
     cmd = list(base_cmd)
     if cookie_source:
         cmd.extend(["--cookies-from-browser", cookie_source])
     cmd.append(use_url)
-    stdout_text = ""
-    stderr_text = ""
+    downloaded: list[Path] = []
+    seen: set[str] = set()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    fail_count = 0
+    skip_count = 0
+    start_count = 0
+    done_count = 0
+    format_failed_ids: list[str] = []
+    n_challenge_failed = False
+
+    def _append_downloaded_line(one_line: str, *, log_done: bool = False):
+        nonlocal done_count
+        s = one_line.strip()
+        if not s:
+            return
+        p = Path(s)
+        if not p.exists():
+            return
+        k = str(p.resolve()).casefold()
+        if k in seen:
+            return
+        seen.add(k)
+        done_count += 1
+        downloaded.append(p.resolve())
+        if log_done:
+            self._log(f"[yt-dlp] 下载完成: {p.name}")
+
     try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=False,
-            check=False,
-            env=self._ytdlp_subprocess_env(),
-            timeout=None if allow_playlist else 1200,
-        )
-        stdout_raw = proc.stdout or b""
-        stderr_raw = proc.stderr or b""
-        stdout_text = stdout_raw.decode("utf-8", errors="replace")
-        stderr_text = stderr_raw.decode("utf-8", errors="replace")
+        if allow_playlist:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,
+                env=self._ytdlp_subprocess_env(),
+            )
+
+            q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
+
+            def _stream_pipe(pipe, source: str):
+                try:
+                    while True:
+                        line = pipe.readline()
+                        if not line:
+                            break
+                        q.put((source, line))
+                finally:
+                    q.put((source, None))
+
+            t_out = threading.Thread(target=_stream_pipe, args=(proc.stdout, "stdout"), daemon=True)
+            t_err = threading.Thread(target=_stream_pipe, args=(proc.stderr, "stderr"), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            ended = {"stdout": False, "stderr": False}
+            while not (ended["stdout"] and ended["stderr"]):
+                try:
+                    source, line = q.get(timeout=0.5)
+                except queue.Empty:
+                    if proc.poll() is not None and t_out.is_alive() is False and t_err.is_alive() is False:
+                        break
+                    continue
+                if line is None:
+                    ended[source] = True
+                    continue
+                line_text = _decode_subprocess_text(line)
+                s = line_text.strip()
+                if source == "stdout":
+                    stdout_lines.append(line_text)
+                    if not s:
+                        continue
+                    if s.startswith("__YT_START__:"):
+                        start_count += 1
+                        self._log(f"[yt-dlp] 正在下载: {s.split(':', 1)[1].strip()}")
+                        continue
+                    _append_downloaded_line(s, log_done=True)
+                else:
+                    stderr_lines.append(line_text)
+                    if not s:
+                        continue
+                    low = s.lower()
+                    if "n challenge" in low and "failed" in low:
+                        n_challenge_failed = True
+                    if (
+                        "already been downloaded" in low
+                        or "has already been downloaded" in low
+                        or "already been recorded in the archive" in low
+                    ):
+                        skip_count += 1
+                        self._log(f"[yt-dlp] 跳过: {s}")
+                    elif "[download] destination:" in low:
+                        self._log(f"[yt-dlp] 正在下载: {s.split(':', 1)[1].strip()}")
+                    elif low.startswith("error:") or " error:" in low:
+                        fail_count += 1
+                        reason = re.sub(r"^.*?error:\s*", "", s, flags=re.IGNORECASE).strip()
+                        self._log(f"[yt-dlp] 下载失败: {reason or s}")
+                        if "requested format is not available" in low:
+                            fmt_m = re.search(r'\[(?:\w+)\]\s+(\S+?):', s)
+                            if fmt_m:
+                                format_failed_ids.append(fmt_m.group(1))
+            proc.wait()
+            stdout_text = "".join(stdout_lines)
+            stderr_text = "".join(stderr_lines)
+            if format_failed_ids:
+                self._log(f"[yt-dlp] 有 {len(format_failed_ids)} 个视频格式不可用，尝试回退格式重试…")
+                # (format, extra_args, label, pass_cookies)
+                _fb_strategies: list[tuple[str, list[str], str, bool]] = [
+                    ("b", [], "最佳单流(b)", True),
+                    ("", [], "默认自动", True),
+                ]
+                if n_challenge_failed:
+                    _fb_strategies.extend([
+                        ("", ["--extractor-args", "youtube:player_client=mweb"],
+                         "mweb客户端", True),
+                        ("bestvideo*+bestaudio/best",
+                         ["--extractor-args", "youtube:player_client=ios"],
+                         "iOS客户端+合并(无cookie)", False),
+                        ("b", ["--extractor-args", "youtube:player_client=ios"],
+                         "iOS客户端+单流(无cookie)", False),
+                    ])
+                retry_base = list(cmd_prefix) + [
+                    "--no-playlist", "--print", "after_move:filepath", "--quiet",
+                    "--embed-metadata", "--embed-thumbnail",
+                    "--retries", "8", "--fragment-retries", "8",
+                    "--download-archive", str(archive_path),
+                    "-o", out_tpl,
+                ]
+                if has_ffmpeg:
+                    retry_base.extend(["--merge-output-format", "mp4", "--remux-video", "mp4"])
+                retry_base.extend(self._ytdlp_js_runtime_args())
+                retry_base.extend(self._ytdlp_impersonate_args())
+                for vid in format_failed_ids:
+                    retry_url = f"https://www.youtube.com/watch?v={vid}"
+                    retried_ok = False
+                    for fb_fmt, fb_extra, fb_label, fb_cookie in _fb_strategies:
+                        rc_cmd = list(retry_base)
+                        if fb_fmt:
+                            rc_cmd.extend(["-f", fb_fmt])
+                        rc_cmd.extend(fb_extra)
+                        if fb_cookie and cookie_source:
+                            rc_cmd.extend(["--cookies-from-browser", cookie_source])
+                        rc_cmd.append(retry_url)
+                        self._log(f"[yt-dlp] 回退重试 [{vid}] {fb_label}")
+                        try:
+                            before_cnt = len(downloaded)
+                            rp = subprocess.run(
+                                rc_cmd, capture_output=True, text=False, check=False,
+                                env=self._ytdlp_subprocess_env(), timeout=600,
+                            )
+                            for rl in _decode_subprocess_text(rp.stdout or b"").splitlines():
+                                _append_downloaded_line(rl.strip(), log_done=True)
+                            if len(downloaded) > before_cnt:
+                                fail_count = max(0, fail_count - 1)
+                                retried_ok = True
+                                break
+                            if rp.returncode != 0:
+                                retry_err = _decode_subprocess_text(rp.stderr or b"").strip()
+                                self._log(f"[yt-dlp] 回退失败 [{vid}] {fb_label}: {retry_err[:300]}")
+                        except Exception as exc:
+                            self._log(f"[yt-dlp] 回退异常 [{vid}]: {exc}")
+                    if not retried_ok:
+                        self._log(f"[yt-dlp] [{vid}] 所有回退格式均失败")
+            if n_challenge_failed:
+                self._log(
+                    "[yt-dlp] 提示: YouTube n challenge 解析失败可能导致部分视频无法下载。"
+                    "请确保已安装最新 Node.js(LTS) 并执行 pip install -U yt-dlp 更新到最新版本。"
+                )
+        else:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=False,
+                check=False,
+                env=self._ytdlp_subprocess_env(),
+                timeout=1200,
+            )
+            stdout_raw = proc.stdout or b""
+            stderr_raw = proc.stderr or b""
+            stdout_text = _decode_subprocess_text(stdout_raw)
+            stderr_text = _decode_subprocess_text(stderr_raw)
+            for one_line in (stdout_text or "").splitlines():
+                _append_downloaded_line(one_line)
     except subprocess.TimeoutExpired:
         self._last_ytdlp_error = "yt-dlp 下载超时，请稍后重试。"
         self._log(f"[yt-dlp] {self._last_ytdlp_error}")
@@ -1096,20 +1522,6 @@ def _download_youtube_to_output_dir_by_ytdlp(
         self._log(f"[yt-dlp] 下载异常: {self._last_ytdlp_error}")
         return []
 
-    downloaded: list[Path] = []
-    seen: set[str] = set()
-    for one_line in (stdout_text or "").splitlines():
-        s = one_line.strip()
-        if not s:
-            continue
-        p = Path(s)
-        if not p.exists():
-            continue
-        k = str(p.resolve()).casefold()
-        if k in seen:
-            continue
-        seen.add(k)
-        downloaded.append(p.resolve())
     if not downloaded:
         candidates = sorted(
             [p for p in output_dir.glob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS],
@@ -1124,10 +1536,15 @@ def _download_youtube_to_output_dir_by_ytdlp(
                 continue
             seen.add(k)
             downloaded.append(one.resolve())
+            done_count += 1
             if not allow_playlist:
                 break
     if downloaded:
         downloaded.sort(key=lambda p: p.stat().st_mtime)
+        if allow_playlist:
+            self._log(
+                f"[yt-dlp] 播放列表下载统计: 开始={start_count} 完成={done_count} 跳过={skip_count} 失败={fail_count}"
+            )
         return downloaded
     err_text = ((stderr_text or "") + "\n" + (stdout_text or "")).strip()
     self._last_ytdlp_need_cookie = self._is_ytdlp_need_cookie_error(err_text)
@@ -2041,10 +2458,15 @@ def bind_network_services_methods(cls):
     cls._chromium_cookie_db_paths = _chromium_cookie_db_paths
     cls._wait_for_chromium_cookie_db = _wait_for_chromium_cookie_db
     cls._wait_for_chromium_cookie_db_copyable = _wait_for_chromium_cookie_db_copyable
+    cls._chromium_cookie_db_copyable_now = _chromium_cookie_db_copyable_now
+    cls._default_cookie_source_for_video = _default_cookie_source_for_video
     cls._ytdlp_js_runtime_args = _ytdlp_js_runtime_args
     cls._ytdlp_impersonate_args = _ytdlp_impersonate_args
     cls._ytdlp_cmd_prefix = _ytdlp_cmd_prefix
     cls._ytdlp_subprocess_env = _ytdlp_subprocess_env
+    cls._ensure_pot_server = _ensure_pot_server
+    cls._ensure_pot_plugin_upgraded = _ensure_pot_plugin_upgraded
+    cls._sync_pot_plugin_version = _sync_pot_plugin_version
     cls._pick_best_ytdlp_format = _pick_best_ytdlp_format
     cls._download_video_by_ytdlp = _download_video_by_ytdlp
     cls._prompt_chromium_login_cookie_async = _prompt_chromium_login_cookie_async
