@@ -168,6 +168,21 @@ def _portable_path_tail_signature(path_obj: Path, depth: int = 4) -> str:
         return ""
 
 
+def _resolve_item_index_by_path(self, path_value: str | None, fallback_index: int | None = None) -> int | None:
+    path_text = str(path_value or "").strip()
+    if path_text:
+        try:
+            idx_map = {str(it.path).casefold(): i for i, it in enumerate(getattr(self, "items", []))}
+            hit = idx_map.get(path_text.casefold())
+            if isinstance(hit, int) and 0 <= hit < len(getattr(self, "items", [])):
+                return hit
+        except Exception:
+            pass
+    if isinstance(fallback_index, int) and 0 <= fallback_index < len(getattr(self, "items", [])):
+        return fallback_index
+    return None
+
+
 def _cover_preview_target_size(self, pix_w: int, pix_h: int) -> QSize:
     if not hasattr(self, "nfo_cover_preview") or not hasattr(self, "nfo_left_stack"):
         return QSize(220, 220)
@@ -860,14 +875,17 @@ def _on_cover_meta_list_context_menu(self, pos):
     row = self.nfo_cover_meta_list.itemAt(pos)
     if row is None:
         return
-    idx = row.data(0, Qt.UserRole)
-    if not isinstance(idx, int) or not (0 <= idx < len(self.items)):
+    row_path = row.data(0, int(Qt.UserRole) + 1)
+    idx = _resolve_item_index_by_path(self, row_path, row.data(0, Qt.UserRole))
+    if not isinstance(idx, int):
         return
+    row.setData(0, Qt.UserRole, idx)
     target_item = self.items[idx]
     selected_indices: set[int] = set()
     for one in self.nfo_cover_meta_list.selectedItems():
-        one_idx = one.data(0, Qt.UserRole)
-        if isinstance(one_idx, int) and (0 <= one_idx < len(self.items)):
+        one_path = one.data(0, int(Qt.UserRole) + 1)
+        one_idx = _resolve_item_index_by_path(self, one_path, one.data(0, Qt.UserRole))
+        if isinstance(one_idx, int):
             selected_indices.add(one_idx)
     is_multi_select = len(selected_indices) > 1
     seed_indices = selected_indices if idx in selected_indices else {idx}
@@ -1681,6 +1699,7 @@ def _sync_cover_selection_from_tree(self):
     while isinstance(parent_of.get(root_idx), int) and root_idx not in walked:
         walked.add(root_idx)
         root_idx = int(parent_of.get(root_idx))
+    root_path_cf = str(self.items[root_idx].path).casefold() if 0 <= root_idx < len(self.items) else ""
     target_item = None
     target_row = -1
     for row in range(self.nfo_cover_gallery.count()):
@@ -1688,7 +1707,11 @@ def _sync_cover_selection_from_tree(self):
         if it is None:
             continue
         payload = it.data(Qt.UserRole)
-        if isinstance(payload, dict) and payload.get("root_index") == root_idx:
+        if not isinstance(payload, dict):
+            continue
+        payload_path_cf = str(payload.get("root_path") or "").strip().casefold()
+        payload_idx = payload.get("root_index")
+        if (payload_path_cf and payload_path_cf == root_path_cf) or (isinstance(payload_idx, int) and payload_idx == root_idx):
             target_item = it
             target_row = row
             break
@@ -1964,7 +1987,9 @@ def _refresh_cover_gallery(self):
         pool.append(
             {
                 "root_index": idx,
+                "root_path": str(item.path),
                 "meta_indices": sub_indices,
+                "meta_paths": [str(self.items[x].path) for x in sub_indices if 0 <= x < len(self.items)],
                 "title": title,
                 "root_dir": str(item.path.parent),
             }
@@ -1981,6 +2006,7 @@ def _refresh_cover_gallery(self):
     self._cover_icon_loaded_rows = set()
     self._cover_icon_queued_rows = set()
     self._cover_visible_load_scheduled = False
+    self._cover_reflow_scheduled = False
     self._cover_scrolling = False
     self._cover_scroll_idle_token = int(getattr(self, "_cover_scroll_idle_token", 0)) + 1
     self._cover_append_scheduled = False
@@ -2020,7 +2046,9 @@ def _refresh_cover_gallery(self):
             Qt.UserRole,
             {
                 "root_index": info.get("root_index"),
+                "root_path": info.get("root_path", ""),
                 "meta_indices": info.get("meta_indices", []),
+                "meta_paths": info.get("meta_paths", []),
                 "root_dir": root_dir_str,
                 "cover_path": "",
                 "cover_kind": known_kind,
@@ -2033,6 +2061,27 @@ def _refresh_cover_gallery(self):
     self._reflow_cover_gallery_rows()
     self._sync_cover_selection_from_tree()
     QTimer.singleShot(0, self._load_visible_cover_icons)
+
+
+def _schedule_cover_gallery_reflow(self, delay_ms: int = 0):
+    if not hasattr(self, "nfo_cover_gallery"):
+        return
+    if bool(getattr(self, "_cover_reflow_scheduled", False)):
+        return
+    self._cover_reflow_scheduled = True
+
+    def _run():
+        self._cover_reflow_scheduled = False
+        if not hasattr(self, "nfo_cover_gallery"):
+            return
+        self._reflow_cover_gallery_rows()
+        try:
+            self.nfo_cover_gallery.doItemsLayout()
+        except Exception:
+            pass
+        self.nfo_cover_gallery.viewport().update()
+
+    QTimer.singleShot(max(0, int(delay_ms)), _run)
 
 
 def _reflow_cover_gallery_rows(self):
@@ -2547,12 +2596,7 @@ def _continue_cover_icon_loading(self, token: int):
                 loaded_local.add(r)
                 self._cover_icon_loaded_rows = loaded_local
                 if layout_changed_local and hasattr(self, "nfo_cover_gallery"):
-                    self._reflow_cover_gallery_rows()
-                    try:
-                        self.nfo_cover_gallery.doItemsLayout()
-                    except Exception:
-                        pass
-                    self.nfo_cover_gallery.viewport().update()
+                    self._schedule_cover_gallery_reflow(18)
                 if getattr(self, "_cover_icon_load_jobs", []):
                     QTimer.singleShot(0, lambda tt=t: self._continue_cover_icon_loading(tt))
 
@@ -2597,8 +2641,8 @@ def _open_cover_detail(self, list_item: QListWidgetItem):
         if root_dir:
             cover_locked = self._resolve_cover_path_for_root(root_dir)
     self._detail_cover_locked_path = cover_locked
-    root_index = payload.get("root_index")
-    if not isinstance(root_index, int) or not (0 <= root_index < len(self.items)):
+    root_index = _resolve_item_index_by_path(self, payload.get("root_path"), payload.get("root_index"))
+    if not isinstance(root_index, int):
         return
     if hasattr(self, "nfo_cover_title"):
         raw_title = str(payload.get("raw_title") or "").strip()
@@ -2657,8 +2701,8 @@ def _open_cover_detail(self, list_item: QListWidgetItem):
 
 
 def _populate_cover_detail_after_transition(self, payload: dict):
-    root_index = payload.get("root_index")
-    if not isinstance(root_index, int) or not (0 <= root_index < len(self.items)):
+    root_index = _resolve_item_index_by_path(self, payload.get("root_path"), payload.get("root_index"))
+    if not isinstance(root_index, int):
         self._hide_left_busy_overlay()
         return
     # 动画后再异步准备数据，遮罩层持续显示直到主数据装载结束。
@@ -2738,6 +2782,7 @@ def _populate_cover_detail_after_transition(self, payload: dict):
             def _build_meta_node(idx: int, parent_row: QTreeWidgetItem | None = None):
                 row = QTreeWidgetItem([_friendly_item_title(self.items[idx])])
                 row.setData(0, Qt.UserRole, idx)
+                row.setData(0, int(Qt.UserRole) + 1, str(self.items[idx].path))
                 index_to_row[idx] = row
                 if parent_row is None:
                     self.nfo_cover_meta_list.addTopLevelItem(row)
@@ -2777,7 +2822,11 @@ def _consume_cover_single_click(self):
     self._pending_cover_click_payload = None
     if not isinstance(payload, dict):
         return
-    root_index = payload.get("root_index")
+    root_index = _resolve_item_index_by_path(self, payload.get("root_path"), payload.get("root_index"))
+    if not isinstance(root_index, int):
+        meta_paths = payload.get("meta_paths", [])
+        if isinstance(meta_paths, list) and meta_paths:
+            root_index = _resolve_item_index_by_path(self, meta_paths[0], None)
     if not isinstance(root_index, int):
         meta_indices = payload.get("meta_indices", [])
         if isinstance(meta_indices, list) and meta_indices:
@@ -2800,8 +2849,8 @@ def _on_cover_gallery_context_menu(self, pos):
     payload = list_item.data(Qt.UserRole)
     if not isinstance(payload, dict):
         return
-    root_idx = payload.get("root_index")
-    if not isinstance(root_idx, int) or not (0 <= root_idx < len(self.items)):
+    root_idx = _resolve_item_index_by_path(self, payload.get("root_path"), payload.get("root_index"))
+    if not isinstance(root_idx, int):
         return
     target_item = self.items[root_idx]
     menu = QMenu(self)
@@ -2858,6 +2907,8 @@ def _start_cover_gallery_rename(self, list_item: QListWidgetItem, root_idx: int)
         payload = list_item.data(Qt.UserRole)
         if isinstance(payload, dict):
             payload["raw_title"] = new_title
+            payload["root_path"] = str(self.items[root_idx].path)
+            payload["root_index"] = int(root_idx)
             payload["root_dir"] = str(self.items[root_idx].path.parent)
             list_item.setData(Qt.UserRole, payload)
 
@@ -2932,8 +2983,13 @@ def _on_cover_meta_selection_changed(self):
     selected = self.nfo_cover_meta_list.selectedItems()
     if len(selected) == 1:
         row = selected[0]
-        idx = row.data(0, Qt.UserRole) if row else None
-        if isinstance(idx, int) and 0 <= idx < len(self.items):
+        idx = _resolve_item_index_by_path(
+            self,
+            row.data(0, int(Qt.UserRole) + 1) if row else "",
+            row.data(0, Qt.UserRole) if row else None,
+        )
+        if isinstance(idx, int):
+            row.setData(0, Qt.UserRole, idx)
             cur_path = str(self.items[idx].path)
             if cur_path != getattr(self, "_rename_sel_path", ""):
                 self._rename_sel_path = cur_path
@@ -2946,9 +3002,10 @@ def _on_cover_meta_selection_changed(self):
     row = selected[0] if selected else self.nfo_cover_meta_list.currentItem()
     if row is None:
         return
-    idx = row.data(0, Qt.UserRole)
+    idx = _resolve_item_index_by_path(self, row.data(0, int(Qt.UserRole) + 1), row.data(0, Qt.UserRole))
     if not isinstance(idx, int):
         return
+    row.setData(0, Qt.UserRole, idx)
     self._cover_meta_pending_idx = int(idx)
     token = int(getattr(self, "_cover_meta_select_token", 0)) + 1
     self._cover_meta_select_token = token
@@ -3037,6 +3094,7 @@ def bind_scan_tree_methods(cls):
     cls._on_cover_gallery_scroll_idle = _on_cover_gallery_scroll_idle
     cls._load_visible_cover_icons = _load_visible_cover_icons
     cls._on_cover_gallery_scrolled = _on_cover_gallery_scrolled
+    cls._schedule_cover_gallery_reflow = _schedule_cover_gallery_reflow
     cls._reflow_cover_gallery_rows = _reflow_cover_gallery_rows
     cls._apply_cover_gallery_hint_mode = _apply_cover_gallery_hint_mode
     cls._configure_cover_gallery_metrics_by_orientation = _configure_cover_gallery_metrics_by_orientation
