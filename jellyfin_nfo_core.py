@@ -486,7 +486,7 @@ def collect_nfo_items(paths: set[Path], progress_cb=None, quick_scan: bool = Fal
         ):
             local_found.add(cur_dir / "movie.nfo")
         # 目录存在视频但缺少同名 nfo 时，补充“同名虚拟 nfo”便于逐视频编辑。
-        if has_video_in_dir and (not has_season_children) and (not is_season_dir) and (not _is_extras_dir(cur_dir)):
+        if has_video_in_dir and (not has_season_children) and (not _is_extras_dir(cur_dir)):
             for stem in sorted(video_stems):
                 nfo_name = f"{stem}.nfo"
                 if nfo_name not in lower_files:
@@ -581,7 +581,7 @@ def collect_nfo_items(paths: set[Path], progress_cb=None, quick_scan: bool = Fal
                 ):
                     local_found.add((cur_dir / "movie.nfo").resolve())
                 # 目录存在视频但缺少同名 nfo 时，补充“同名虚拟 nfo”便于逐视频编辑。
-                if has_video_in_dir and (not has_season_children) and (not is_season_dir) and (not _is_extras_dir(cur_dir)):
+                if has_video_in_dir and (not has_season_children) and (not _is_extras_dir(cur_dir)):
                     for stem in sorted(video_stems):
                         nfo_name = f"{stem}.nfo"
                         if nfo_name not in lower_files:
