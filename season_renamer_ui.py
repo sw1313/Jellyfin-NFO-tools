@@ -2,6 +2,7 @@ import json
 import re
 import uuid
 import sys
+import threading
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -228,23 +229,27 @@ def drop_last_history_batch():
     save_history(history)
 
 
-def execute_renames(ops: list[RenameOp]) -> list[str]:
+def execute_renames(ops: list[RenameOp], progress_cb=None) -> list[str]:
     logs: list[str] = []
     if not ops:
         return logs
+    total = len(ops) * 2
 
-    # 两段式重命名：先改临时名，避免循环/重名冲突
-    for op in ops:
+    for i, op in enumerate(ops):
         temp_name = f".tmp_rename_{uuid.uuid4().hex}{op.source.suffix}"
         op.temp = op.source.with_name(temp_name)
         op.source.rename(op.temp)
         logs.append(f"[临时] {op.source.name} -> {op.temp.name}")
+        if progress_cb:
+            progress_cb(i + 1, total)
 
-    for op in ops:
+    for i, op in enumerate(ops):
         if op.temp is None:
             continue
         op.temp.rename(op.target)
         logs.append(f"[完成] {op.source.name} -> {op.target.name}")
+        if progress_cb:
+            progress_cb(len(ops) + i + 1, total)
 
     return logs
 
@@ -285,6 +290,7 @@ class App(tk.Tk):
         self.title("季度批量重命名工具")
         self.geometry("860x560")
         self.paths: set[Path] = set()
+        self._busy = False
 
         self._build_ui()
         self._enable_drag_drop_if_possible()
@@ -293,15 +299,18 @@ class App(tk.Tk):
         top_frame = tk.Frame(self)
         top_frame.pack(fill=tk.X, padx=12, pady=8)
 
-        tk.Button(top_frame, text="添加文件夹", command=self.add_folder).pack(side=tk.LEFT, padx=4)
-        tk.Button(top_frame, text="添加视频文件", command=self.add_files).pack(side=tk.LEFT, padx=4)
-        tk.Button(top_frame, text="清空列表", command=self.clear_paths).pack(side=tk.LEFT, padx=4)
-        tk.Button(top_frame, text="还原上次重命名", command=self.undo_last_rename, bg="#aa6f39", fg="white").pack(
-            side=tk.RIGHT, padx=4
-        )
-        tk.Button(top_frame, text="开始重命名", command=self.start_rename, bg="#3e8e41", fg="white").pack(
-            side=tk.RIGHT, padx=4
-        )
+        self.btn_add_folder = tk.Button(top_frame, text="添加文件夹", command=self.add_folder)
+        self.btn_add_folder.pack(side=tk.LEFT, padx=4)
+        self.btn_add_files = tk.Button(top_frame, text="添加视频文件", command=self.add_files)
+        self.btn_add_files.pack(side=tk.LEFT, padx=4)
+        self.btn_clear = tk.Button(top_frame, text="清空列表", command=self.clear_paths)
+        self.btn_clear.pack(side=tk.LEFT, padx=4)
+        self.btn_undo = tk.Button(top_frame, text="还原上次重命名", command=self.undo_last_rename, bg="#aa6f39", fg="white")
+        self.btn_undo.pack(side=tk.RIGHT, padx=4)
+        self.btn_start = tk.Button(top_frame, text="开始重命名", command=self.start_rename, bg="#3e8e41", fg="white")
+        self.btn_start.pack(side=tk.RIGHT, padx=4)
+
+        self._all_buttons = [self.btn_add_folder, self.btn_add_files, self.btn_clear, self.btn_undo, self.btn_start]
 
         hint = (
             "支持输入：\n"
@@ -322,6 +331,11 @@ class App(tk.Tk):
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.path_listbox.config(yscrollcommand=scroll.set)
 
+        self.status_var = tk.StringVar(value="就绪")
+        status_bar = tk.Frame(self)
+        status_bar.pack(fill=tk.X, padx=12)
+        tk.Label(status_bar, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         log_label = tk.Label(self, text="执行日志：", anchor="w")
         log_label.pack(fill=tk.X, padx=12)
 
@@ -329,11 +343,26 @@ class App(tk.Tk):
         self.log_text.pack(fill=tk.BOTH, padx=12, pady=(0, 12))
         self.log_text.config(state=tk.DISABLED)
 
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        state = tk.DISABLED if busy else tk.NORMAL
+        for btn in self._all_buttons:
+            btn.config(state=state)
+
     def _log(self, message: str):
         self.log_text.config(state=tk.NORMAL)
         self.log_text.insert(tk.END, message + "\n")
         self.log_text.see(tk.END)
         self.log_text.config(state=tk.DISABLED)
+
+    def _log_safe(self, message: str):
+        self.after(0, self._log, message)
+
+    def _status(self, text: str):
+        self.status_var.set(text)
+
+    def _status_safe(self, text: str):
+        self.after(0, self._status, text)
 
     def _add_path(self, path_str: str):
         path = Path(path_str).resolve()
@@ -375,74 +404,113 @@ class App(tk.Tk):
             windnd.hook_dropfiles(self, func=_drop)
             self._log("拖拽已启用。")
         except Exception:
-            self._log("未启用拖拽（可安装 windnd）。仍可使用“添加文件夹/文件”。")
+            self._log('未启用拖拽（可安装 windnd）。仍可使用"添加文件夹/文件"。')
+
+    # ---- 重命名（后台线程） ----
 
     def start_rename(self):
+        if self._busy:
+            return
         if not self.paths:
             messagebox.showwarning("提示", "请先添加文件夹或文件。")
             return
+        self._set_busy(True)
+        self._status("正在扫描文件…")
+        paths_snapshot = set(self.paths)
+        threading.Thread(target=self._rename_worker, args=(paths_snapshot,), daemon=True).start()
 
-        all_files: set[Path] = set()
-        for path in self.paths:
-            all_files.update(collect_video_files_from_input(path))
-
-        if not all_files:
-            messagebox.showwarning("提示", "没有发现可处理的视频文件。")
-            return
-
-        grouped = group_by_season(all_files)
-        if not grouped:
-            messagebox.showwarning("提示", "未找到季度文件夹下的视频文件（例如 Season1、Season 2）。")
-            return
-
-        ops, skipped_tagged = build_rename_ops(grouped)
-        valid_ops, skipped_conflicts = validate_conflicts(ops)
-        skipped = skipped_tagged + skipped_conflicts
-
-        self._log("=" * 70)
-        self._log(f"共识别视频: {len(all_files)}，可执行重命名: {len(valid_ops)}，跳过: {len(skipped)}")
-        for msg in skipped:
-            self._log(msg)
-
-        if not valid_ops:
-            messagebox.showinfo("结果", "没有可执行的重命名操作。")
-            return
-
+    def _rename_worker(self, paths: set[Path]):
         try:
-            logs = execute_renames(valid_ops)
+            all_files: set[Path] = set()
+            for p in paths:
+                all_files.update(collect_video_files_from_input(p))
+
+            if not all_files:
+                self.after(0, lambda: messagebox.showwarning("提示", "没有发现可处理的视频文件。"))
+                return
+
+            self._status_safe(f"已扫描到 {len(all_files)} 个视频，正在构建重命名计划…")
+            grouped = group_by_season(all_files)
+            if not grouped:
+                self.after(0, lambda: messagebox.showwarning("提示", "未找到季度文件夹下的视频文件（例如 Season1、Season 2）。"))
+                return
+
+            ops, skipped_tagged = build_rename_ops(grouped)
+            self._status_safe(f"正在校验冲突… ({len(ops)} 项)")
+            valid_ops, skipped_conflicts = validate_conflicts(ops)
+            skipped = skipped_tagged + skipped_conflicts
+
+            self._log_safe("=" * 70)
+            self._log_safe(f"共识别视频: {len(all_files)}，可执行重命名: {len(valid_ops)}，跳过: {len(skipped)}")
+            for msg in skipped:
+                self._log_safe(msg)
+
+            if not valid_ops:
+                self.after(0, lambda: messagebox.showinfo("结果", "没有可执行的重命名操作。"))
+                return
+
+            total_steps = len(valid_ops) * 2
+
+            def _on_progress(done, _total):
+                self._status_safe(f"正在重命名… {done}/{_total}")
+
+            self._status_safe(f"正在重命名 {len(valid_ops)} 个文件（共 {total_steps} 步）…")
+            logs = execute_renames(valid_ops, progress_cb=_on_progress)
             append_history_batch(valid_ops)
             for msg in logs:
-                self._log(msg)
-            messagebox.showinfo("完成", f"重命名完成，共处理 {len(valid_ops)} 个文件。")
+                self._log_safe(msg)
+            n = len(valid_ops)
+            self.after(0, lambda: messagebox.showinfo("完成", f"重命名完成，共处理 {n} 个文件。"))
         except Exception as exc:
-            self._log(f"执行失败: {exc}")
-            messagebox.showerror("错误", f"执行失败：{exc}")
+            self._log_safe(f"执行失败: {exc}")
+            err_msg = str(exc)
+            self.after(0, lambda: messagebox.showerror("错误", f"执行失败：{err_msg}"))
+        finally:
+            self.after(0, self._set_busy, False)
+            self._status_safe("就绪")
+
+    # ---- 还原（后台线程） ----
 
     def undo_last_rename(self):
+        if self._busy:
+            return
         batch = get_last_history_batch()
         if batch is None:
             messagebox.showinfo("提示", "没有可还原的重命名记录。")
             return
+        self._set_busy(True)
+        self._status("正在准备还原…")
+        threading.Thread(target=self._undo_worker, args=(batch,), daemon=True).start()
 
-        ops, skipped = build_undo_ops_from_batch(batch)
-        self._log("=" * 70)
-        self._log(f"准备还原：可执行 {len(ops)}，跳过 {len(skipped)}")
-        for msg in skipped:
-            self._log(msg)
-
-        if not ops:
-            messagebox.showinfo("结果", "没有可执行的还原操作。")
-            return
-
+    def _undo_worker(self, batch: dict):
         try:
-            logs = execute_renames(ops)
+            ops, skipped = build_undo_ops_from_batch(batch)
+            self._log_safe("=" * 70)
+            self._log_safe(f"准备还原：可执行 {len(ops)}，跳过 {len(skipped)}")
+            for msg in skipped:
+                self._log_safe(msg)
+
+            if not ops:
+                self.after(0, lambda: messagebox.showinfo("结果", "没有可执行的还原操作。"))
+                return
+
+            def _on_progress(done, total):
+                self._status_safe(f"正在还原… {done}/{total}")
+
+            self._status_safe(f"正在还原 {len(ops)} 个文件…")
+            logs = execute_renames(ops, progress_cb=_on_progress)
             for msg in logs:
-                self._log(f"[还原]{msg}")
+                self._log_safe(f"[还原]{msg}")
             drop_last_history_batch()
-            messagebox.showinfo("完成", f"还原完成，共处理 {len(ops)} 个文件。")
+            n = len(ops)
+            self.after(0, lambda: messagebox.showinfo("完成", f"还原完成，共处理 {n} 个文件。"))
         except Exception as exc:
-            self._log(f"还原执行失败: {exc}")
-            messagebox.showerror("错误", f"还原执行失败：{exc}")
+            self._log_safe(f"还原执行失败: {exc}")
+            err_msg = str(exc)
+            self.after(0, lambda: messagebox.showerror("错误", f"还原执行失败：{err_msg}"))
+        finally:
+            self.after(0, self._set_busy, False)
+            self._status_safe("就绪")
 
 
 if __name__ == "__main__":
