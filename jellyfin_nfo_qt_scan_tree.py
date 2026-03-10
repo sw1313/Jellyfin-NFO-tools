@@ -273,7 +273,7 @@ def _friendly_item_title(item: NfoItem) -> str:
     if mt == "season":
         name = _format_season_name(item.path.parent.name)
     elif mt == "episode":
-        stem = item.path.stem.strip()
+        stem = _normalize_sxxexx_case(item.path.stem.strip())
         name = stem if stem else item.path.parent.name
     else:
         name = item.path.parent.name.strip() or item.path.stem.strip()
@@ -1052,7 +1052,7 @@ def _get_rename_initial_text(item: NfoItem) -> str | None:
         m = re.match(r"^season\s*(\d+)$", item.path.parent.name.strip(), re.IGNORECASE)
         return str(int(m.group(1))) if m else item.path.parent.name
     if mt in {"episode", "movie_or_video_item"}:
-        return item.path.stem
+        return _normalize_sxxexx_case(item.path.stem)
     return None
 
 
@@ -1228,8 +1228,16 @@ def _exec_rename_season(self, item: NfoItem, new_num_text: str) -> bool:
     return True
 
 
+def _normalize_sxxexx_case(text: str) -> str:
+    return re.sub(
+        r'(?<!\w)[sS](\d+)[eE](\d+)(?!\w)',
+        lambda m: f"S{m.group(1)}E{m.group(2)}",
+        text,
+    )
+
 def _exec_rename_episode(self, item: NfoItem, new_stem: str) -> bool:
     safe = re.sub(r'[\\/:*?"<>|]+', "", new_stem).strip()
+    safe = _normalize_sxxexx_case(safe)
     if not safe:
         QMessageBox.warning(self, "重命名失败", "名称不合法。")
         return False
