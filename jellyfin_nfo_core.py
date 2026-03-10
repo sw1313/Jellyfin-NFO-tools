@@ -37,7 +37,26 @@ DISCOVERY_VIDEO_EXTS = {
 }
 SCAN_CACHE_VERSION = 6
 SCAN_CACHE_FILE = Path(__file__).with_name(".nfo_scan_index.json")
-SESSION_SQLITE_FILE = Path(__file__).with_name(".jellyfin_qt_session.sqlite3")
+
+def _local_session_db_path() -> Path:
+    """Keep SQLite session DB on a local disk to avoid SMB locking issues."""
+    _fallback = Path(__file__).with_name(".jellyfin_qt_session.sqlite3")
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    if not local_app:
+        return _fallback
+    local_dir = Path(local_app) / "jellyfin-nfo-tools"
+    try:
+        local_dir.mkdir(parents=True, exist_ok=True)
+        # Migrate old network DB on first run
+        local_db = local_dir / ".jellyfin_qt_session.sqlite3"
+        if not local_db.exists() and _fallback.exists():
+            import shutil
+            shutil.copy2(str(_fallback), str(local_db))
+        return local_db
+    except OSError:
+        return _fallback
+
+SESSION_SQLITE_FILE = _local_session_db_path()
 SCAN_CACHE_TABLE = "scan_cache_roots"
 
 FIELD_DEFINITIONS: list[tuple[str, str]] = [
@@ -466,7 +485,7 @@ def collect_nfo_items(paths: set[Path], progress_cb=None, quick_scan: bool = Fal
                     lower_files.add(low)
                     if low.endswith(tuple(DISCOVERY_VIDEO_EXTS)):
                         has_video_in_dir = True
-                        video_stems.add(Path(name).stem.casefold())
+                        video_stems.add(Path(name).stem.lower())
         except Exception:
             return local_found
 
@@ -564,7 +583,7 @@ def collect_nfo_items(paths: set[Path], progress_cb=None, quick_scan: bool = Fal
                 lower_files = {f.lower() for f in files}
                 has_season_children = any(SEASON_DIR_RE.match(d or "") for d in dirs)
                 is_season_dir = SEASON_DIR_RE.match(cur_dir.name or "") is not None
-                video_stems = {Path(name).stem.casefold() for name in files if name.lower().endswith(tuple(DISCOVERY_VIDEO_EXTS))}
+                video_stems = {Path(name).stem.lower() for name in files if name.lower().endswith(tuple(DISCOVERY_VIDEO_EXTS))}
                 has_video_in_dir = bool(video_stems)
 
                 # 轻量推断目录级“应有 nfo”（不创建文件，仅用于 UI 可编辑项）
@@ -799,11 +818,11 @@ def parse_nfo_fields(path: Path) -> dict[str, str]:
             alias_plot = text
         if tag in {"rating", "customrating"}:
             alias_rating = text
-    if alias_title:
+    if alias_title and not data.get("title", "").strip():
         data["title"] = alias_title
-    if alias_plot:
+    if alias_plot and not data.get("plot", "").strip():
         data["plot"] = alias_plot
-    if alias_rating:
+    if alias_rating and not data.get("rating", "").strip():
         data["rating"] = alias_rating
     return data
 
@@ -820,6 +839,10 @@ def upsert_single(root: ET.Element, tag: str, value: str):
 
 
 def _read_inner_xml(node: ET.Element) -> str:
+    """读取元素的 inner XML 文本（含子标签）。
+
+    ET.tostring(child) 已包含 child.tail，不可再重复拼接。
+    """
     parts: list[str] = []
     if node.text:
         parts.append(node.text)
@@ -829,6 +852,13 @@ def _read_inner_xml(node: ET.Element) -> str:
 
 
 def upsert_single_rich(root: ET.Element, tag: str, value: str):
+    """写入可能含 HTML 的字段（如 plot）。
+
+    Jellyfin 的 C# XML 读取器用 InnerText 取文本；如果把 <br>/<a> 写成真正的
+    XML 子元素，InnerText 会跳过标签，导致换行和链接全丢。
+    正确做法：将 HTML 作为纯文本存入节点（ET 自动转义 < > &），这样 Jellyfin
+    读取到的 InnerText 就是完整的 HTML 字符串，前端可正常渲染。
+    """
     nodes = root.findall(tag)
     if nodes:
         node = nodes[0]
@@ -839,23 +869,8 @@ def upsert_single_rich(root: ET.Element, tag: str, value: str):
 
     for child in list(node):
         node.remove(child)
-    node.text = None
 
-    rich = value.strip()
-    if not rich:
-        return
-
-    # 通过临时容器解析 inner XML，解析失败回退为纯文本。
-    try:
-        wrapper = ET.fromstring(f"<wrapper>{rich}</wrapper>")
-    except ET.ParseError:
-        node.text = rich
-        return
-
-    node.text = wrapper.text
-    for child in list(wrapper):
-        wrapper.remove(child)
-        node.append(child)
+    node.text = value.strip() or None
 
 
 def replace_multi(root: ET.Element, tag: str, values: list[str]):
@@ -864,6 +879,20 @@ def replace_multi(root: ET.Element, tag: str, values: list[str]):
     for value in values:
         node = ET.SubElement(root, tag)
         node.text = value
+
+
+def _write_xml_atomic(tree: ET.ElementTree, path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
+    os.replace(tmp_path, path)
+
+
+def _copy_file_atomic(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.with_name(f".{dst.name}.tmp")
+    shutil.copy2(src, tmp_path)
+    os.replace(tmp_path, dst)
 
 
 def write_nfo_fields(path: Path, fields: dict[str, str]):
@@ -886,6 +915,11 @@ def write_nfo_fields(path: Path, fields: dict[str, str]):
     for tag, value in fields.items():
         clean_value = value.strip()
         if not clean_value:
+            if tag in MULTI_VALUE_TAGS:
+                replace_multi(root, tag, [])
+            else:
+                for node in root.findall(tag):
+                    root.remove(node)
             continue
         if tag in MULTI_VALUE_TAGS:
             replace_multi(root, tag, split_multi_values(clean_value))
@@ -893,8 +927,14 @@ def write_nfo_fields(path: Path, fields: dict[str, str]):
             upsert_single_rich(root, tag, clean_value)
         else:
             upsert_single(root, tag, clean_value)
+    # outline 是 Jellyfin 扫描时自动生成的纯文本摘要，和 plot 的 HTML 内容冲突。
+    # Jellyfin 重新处理 NFO 时可能用 outline 覆盖 plot，导致 HTML 格式丢失。
+    if root.find("plot") is not None:
+        for outline_node in root.findall("outline"):
+            root.remove(outline_node)
+    upsert_single(root, "lockdata", "false")
     ET.indent(tree, space="  ")
-    tree.write(path, encoding="utf-8", xml_declaration=True)
+    _write_xml_atomic(tree, path)
 
 
 def upsert_art_child(root: ET.Element, child_name: str, value: str):
@@ -950,7 +990,7 @@ def apply_artwork_files(
     if thumb_src is not None:
         thumb_name = build_image_filename(media_type, thumb_kind, thumb_src.suffix)
         thumb_target = target_dir / thumb_name
-        shutil.copy2(thumb_src, thumb_target)
+        _copy_file_atomic(thumb_src, thumb_target)
         if thumb_kind in {"primary", "thumb"}:
             upsert_single(root, "thumb", thumb_name)
         if thumb_kind == "backdrop":
@@ -960,15 +1000,19 @@ def apply_artwork_files(
     if fanart_src is not None:
         fanart_name = build_image_filename(media_type, fanart_kind, fanart_src.suffix)
         fanart_target = target_dir / fanart_name
-        shutil.copy2(fanart_src, fanart_target)
+        _copy_file_atomic(fanart_src, fanart_target)
         if fanart_kind in {"primary", "thumb"}:
             upsert_single(root, "thumb", fanart_name)
         if fanart_kind == "backdrop":
             upsert_single(root, "fanart", fanart_name)
         upsert_art_child(root, _art_child_for_kind(fanart_kind), fanart_name)
 
+    if root.find("plot") is not None:
+        for outline_node in root.findall("outline"):
+            root.remove(outline_node)
+    upsert_single(root, "lockdata", "false")
     ET.indent(tree, space="  ")
-    tree.write(nfo_path, encoding="utf-8", xml_declaration=True)
+    _write_xml_atomic(tree, nfo_path)
 
 
 def validate_edit_values(edits: dict[str, str]) -> list[str]:
