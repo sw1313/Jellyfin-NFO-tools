@@ -197,6 +197,124 @@ def _is_twitter_url(self, url: str) -> bool:
     return host in {"x.com", "twitter.com", "mobile.twitter.com"}
 
 
+def _is_twitter_profile_url(self, url: str) -> bool:
+    """True when *url* is a Twitter/X user profile page (not a single tweet)."""
+    if not self._is_twitter_url(url):
+        return False
+    path = (urlparse(url).path or "").strip("/")
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[1].lower() == "status":
+        return False
+    _SKIP = {
+        "i", "search", "explore", "settings", "home",
+        "notifications", "messages", "compose", "login", "signup", "",
+    }
+    return bool(parts and parts[0].lower() not in _SKIP)
+
+
+def _gallery_dl_cmd_prefix(self) -> list[str]:
+    """Return the command prefix for gallery-dl, or [] if not installed."""
+    gdl_bin = shutil.which("gallery-dl")
+    if gdl_bin:
+        return [gdl_bin]
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "gallery_dl", "--version"],
+            capture_output=True, check=True, timeout=10,
+        )
+        return [sys.executable, "-m", "gallery_dl"]
+    except Exception:
+        return []
+
+
+def _export_webview2_cookies_to_file(self) -> str | None:
+    """Decrypt WebView2 cookies and write a Netscape cookie file.
+
+    Returns the path to the cookie file, or None on failure.
+    """
+    import base64
+    import json
+    import sqlite3
+    import tempfile
+
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        return None
+
+    profile = self._chromium_profile_dir()
+    local_state_path = profile / "EBWebView" / "Local State"
+    db_path = profile / "EBWebView" / "Default" / "Network" / "Cookies"
+    if not local_state_path.exists() or not db_path.exists():
+        return None
+
+    with open(local_state_path, "r", encoding="utf-8") as f:
+        local_state = json.load(f)
+    b64_key = local_state.get("os_crypt", {}).get("encrypted_key", "")
+    if not b64_key:
+        return None
+    encrypted_key = base64.b64decode(b64_key)
+    if encrypted_key[:5] != b"DPAPI":
+        return None
+    encrypted_key = encrypted_key[5:]
+
+    import ctypes
+    import ctypes.wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", ctypes.wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    blob_in = DATA_BLOB(len(encrypted_key), ctypes.create_string_buffer(encrypted_key, len(encrypted_key)))
+    blob_out = DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        return None
+    aes_key = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+    aesgcm = AESGCM(aes_key)
+
+    tmp_db = tempfile.mktemp(suffix=".db")
+    shutil.copy2(str(db_path), tmp_db)
+    conn = sqlite3.connect(tmp_db)
+    rows = conn.execute(
+        "SELECT host_key, path, is_secure, expires_utc, name, encrypted_value, is_httponly FROM cookies"
+    ).fetchall()
+    conn.close()
+    os.unlink(tmp_db)
+
+    cookie_path = str(profile / ".gallery_dl_cookies.txt")
+    with open(cookie_path, "w", encoding="utf-8") as f:
+        f.write("# Netscape HTTP Cookie File\n")
+        for host, path, secure, expires, name, enc_val, httponly in rows:
+            if not enc_val:
+                continue
+            try:
+                if enc_val[:3] in (b"v10", b"v20"):
+                    nonce = enc_val[3:15]
+                    ciphertext = enc_val[15:]
+                    raw = aesgcm.decrypt(nonce, ciphertext, None)
+                    if len(raw) > 32:
+                        try:
+                            raw[:32].decode("utf-8")
+                        except UnicodeDecodeError:
+                            raw = raw[32:]
+                    value = raw.decode("utf-8", errors="replace")
+                    value = value.replace("\n", "").replace("\r", "").replace("\t", "")
+                else:
+                    continue
+            except Exception:
+                continue
+            secure_str = "TRUE" if secure else "FALSE"
+            httponly_prefix = "#HttpOnly_" if httponly else ""
+            domain_flag = "TRUE" if host.startswith(".") else "FALSE"
+            chrome_epoch = 11644473600
+            unix_expires = max(0, int(expires / 1_000_000) - chrome_epoch) if expires else 0
+            f.write(f"{httponly_prefix}{host}\t{domain_flag}\t{path}\t{secure_str}\t{unix_expires}\t{name}\t{value}\n")
+    return cookie_path
+
+
 def _normalize_video_download_url(self, url: str) -> str:
     """对页面视频链接做轻量规范化，提升 yt-dlp 命中率。"""
     raw = (url or "").strip()
@@ -206,13 +324,21 @@ def _normalize_video_download_url(self, url: str) -> str:
         return raw
     try:
         p = urlparse(raw)
-        m = re.match(r"^/(?:i/web/)?([^/]+)/status/(\d+)(?:/.*)?$", p.path or "", flags=re.IGNORECASE)
-        if not m:
-            return raw
-        user = m.group(1)
-        sid = m.group(2)
-        clean = p._replace(path=f"/{user}/status/{sid}", params="", query="", fragment="")
-        return clean.geturl()
+        path = (p.path or "").rstrip("/")
+        # 单条推文 /user/status/123
+        m = re.match(r"^/(?:i/web/)?([^/]+)/status/(\d+)(?:/.*)?$", path, flags=re.IGNORECASE)
+        if m:
+            user = m.group(1)
+            sid = m.group(2)
+            return p._replace(path=f"/{user}/status/{sid}", params="", query="", fragment="").geturl()
+        # 用户主页 /user 或 /user/media 等：规范到 /user（yt-dlp 不识别 /media 子路径）
+        _NON_PROFILE = {"i", "search", "explore", "settings", "home", "notifications", "messages", "compose", "login", "signup"}
+        m_prof = re.match(r"^/([^/]+)(?:/(media|likes|with_replies))?$", path, flags=re.IGNORECASE)
+        if m_prof:
+            user = m_prof.group(1)
+            if user.lower() not in _NON_PROFILE:
+                return p._replace(path=f"/{user}", params="", query="", fragment="").geturl()
+        return raw
     except Exception:
         return raw
 
@@ -248,6 +374,8 @@ def _is_twitter_need_cookie_error(self, text: str) -> bool:
         or ("downloading graphql json" in t)
         or ("sensitive content" in t)
         or ("requires authentication" in t)
+        or ("authrequired" in t)
+        or ("authenticated cookies" in t)
         or ("not authorized" in t)
         or ("http error 401" in t)
         or ("http error 403" in t)
@@ -389,9 +517,98 @@ def _ytdlp_subprocess_env(self) -> dict[str, str]:
     return env
 
 def _ytdlp_archive_path(base_dir: Path) -> Path:
+    """Keep yt-dlp download archive on local disk to avoid SMB locking."""
     base = Path(base_dir).resolve()
     base.mkdir(parents=True, exist_ok=True)
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app:
+        local_dir = Path(local_app) / "yt-dlp-archives"
+        try:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            archive_name = re.sub(r'[\\/:*?"<>|]+', "_", str(base)) + ".txt"
+            local_archive = local_dir / archive_name
+            # Migrate existing archive from network to local
+            net_archive = base / ".yt-dlp-archive.txt"
+            if not local_archive.exists() and net_archive.exists():
+                shutil.copy2(str(net_archive), str(local_archive))
+            return local_archive
+        except OSError:
+            pass
     return base / ".yt-dlp-archive.txt"
+
+def _is_network_path(p: Path) -> bool:
+    """Detect UNC paths and mapped network drives (Windows)."""
+    s = str(p)
+    if s.startswith("\\\\"):
+        return True
+    drive = os.path.splitdrive(s)[0]
+    if drive:
+        try:
+            import ctypes
+            return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == 4
+        except Exception:
+            pass
+    return False
+
+
+def _local_staging_dir(network_dir: Path) -> Path:
+    """Create a unique local staging dir for downloading before moving to SMB."""
+    import hashlib
+    base = Path(os.environ.get("LOCALAPPDATA", "")) / "yt-dlp-staging"
+    key = hashlib.sha1(str(network_dir).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    staging = base / key
+    staging.mkdir(parents=True, exist_ok=True)
+    return staging
+
+
+def _move_downloaded_to_final(
+    downloaded: list[Path],
+    staging_dir: Path,
+    final_dir: Path,
+    log_fn,
+    tag: str = "yt-dlp",
+) -> list[Path]:
+    """Move remaining staging files to the real network output dir.
+
+    Files already at final_dir (moved earlier by the streaming callback) are
+    kept as-is; only files still inside staging_dir are actually moved.
+    """
+    final_dir.mkdir(parents=True, exist_ok=True)
+    result: list[Path] = []
+    staging_str = str(staging_dir.resolve()).casefold()
+    for p in downloaded:
+        # Already at final destination (moved earlier by _append_downloaded_line)
+        try:
+            if str(p.parent.resolve()).casefold() != staging_str:
+                result.append(p)
+                continue
+        except Exception:
+            pass
+        if not p.exists():
+            continue
+        dest = final_dir / p.name
+        try:
+            if dest.exists():
+                dest.unlink()
+            shutil.move(str(p), str(dest))
+            result.append(dest)
+            log_fn(f"[{tag}] 已移动到目标: {dest.name}")
+        except Exception:
+            try:
+                shutil.copy2(str(p), str(dest))
+                p.unlink(missing_ok=True)
+                result.append(dest)
+                log_fn(f"[{tag}] 已复制到目标: {dest.name}")
+            except Exception as exc2:
+                log_fn(f"[{tag}] 移动失败: {p.name} -> {exc2}")
+    try:
+        remaining = list(staging_dir.iterdir())
+        if not remaining:
+            staging_dir.rmdir()
+    except Exception:
+        pass
+    return result
+
 
 # --------------- bgutil PO Token 服务自动管理 ---------------
 _POT_SERVER_PORT = 4416
@@ -419,6 +636,14 @@ def _find_npm_bin() -> str | None:
     return None
 
 def _pot_server_dir() -> Path:
+    local_app = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app:
+        d = Path(local_app) / "bgutil_pot_server"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+        except OSError:
+            pass
     return Path(__file__).with_name(".bgutil_pot_server")
 
 def _pot_server_main_js() -> Path:
@@ -712,7 +937,7 @@ def _download_video_by_ytdlp(
             "--downloader",
             "aria2c",
             "--downloader-args",
-            "aria2c:-x16 -s16 -k1M --file-allocation=none",
+            "aria2c:-x4 -s4 -k2M --file-allocation=none --retry-wait=5 --max-tries=8",
         ])
         self._log("[yt-dlp] 检测到 aria2c，启用并发下载加速。")
     else:
@@ -952,7 +1177,7 @@ def _prompt_chromium_login_cookie_async(self, open_url: str, message: str, on_do
             QMessageBox.warning(self, "未打开视频页", "请在 WebView2 中点进一个具体视频页面后，再点“确认并继续”。")
             on_done(None)
             return
-        if self._is_youtube_url(confirmed_url):
+        if self._is_youtube_url(confirmed_url) or self._is_twitter_url(confirmed_url):
             self._last_confirmed_video_url = confirmed_url
         # WebView2 窗口关闭后，等待 cookies 数据库可复制，避免 yt-dlp 立刻读取失败。
         if not self._wait_for_chromium_cookie_db(timeout_sec=10.0):
@@ -1315,7 +1540,7 @@ def _download_youtube_to_output_dir_by_ytdlp(
             "--downloader",
             "aria2c",
             "--downloader-args",
-            "aria2c:-x16 -s16 -k1M --file-allocation=none",
+            "aria2c:-x4 -s4 -k2M --file-allocation=none --retry-wait=5 --max-tries=8",
         ])
     else:
         base_cmd.extend(["--http-chunk-size", "10M"])
@@ -1326,6 +1551,47 @@ def _download_youtube_to_output_dir_by_ytdlp(
     if has_ffmpeg:
         base_cmd.extend(["-f", "bestvideo*+bestaudio/best"])
     use_url = self._normalize_video_download_url(url) or (url or "").strip()
+
+    # ---- 下载前先拉一份文件名列表写入磁盘 ----
+    filenames_list_path = output_dir / ".yt-dlp-filenames.txt"
+    _list_print_tpl = f"[{root_title_clean}] %(title).180B [%(id)s]"
+    _list_cmd = [
+        *cmd_prefix,
+        "--flat-playlist",
+        "--print", _list_print_tpl,
+    ]
+    if allow_playlist:
+        _list_cmd.extend(["--yes-playlist", "--ignore-errors", "--no-abort-on-error"])
+    else:
+        _list_cmd.append("--no-playlist")
+    _list_cmd.extend(self._ytdlp_js_runtime_args())
+    _list_cmd.extend(self._ytdlp_impersonate_args())
+    if cookie_source:
+        _list_cmd.extend(["--cookies-from-browser", cookie_source])
+    _list_cmd.append(use_url)
+    self._log("[yt-dlp] 正在获取文件名列表…")
+    try:
+        _list_proc = subprocess.run(
+            _list_cmd,
+            capture_output=True,
+            text=False,
+            check=False,
+            env=self._ytdlp_subprocess_env(),
+            timeout=120,
+        )
+        _list_stdout = _decode_subprocess_text(_list_proc.stdout or b"")
+        _fn_lines = [ln.strip() for ln in _list_stdout.splitlines() if ln.strip()]
+        if _fn_lines:
+            with open(filenames_list_path, "w", encoding="utf-8") as _f:
+                _f.write("\n".join(_fn_lines) + "\n")
+            self._log(f"[yt-dlp] 文件名列表已写入 {filenames_list_path.name} ({len(_fn_lines)} 条)")
+        else:
+            self._log("[yt-dlp] 文件名列表为空（无可用视频条目）")
+    except subprocess.TimeoutExpired:
+        self._log("[yt-dlp] 获取文件名列表超时，跳过，继续下载…")
+    except Exception as exc:
+        self._log(f"[yt-dlp] 获取文件名列表失败: {exc}，继续下载…")
+
     cmd = list(base_cmd)
     if cookie_source:
         cmd.extend(["--cookies-from-browser", cookie_source])
@@ -1339,6 +1605,8 @@ def _download_youtube_to_output_dir_by_ytdlp(
     start_count = 0
     done_count = 0
     format_failed_ids: list[str] = []
+    aria2c_failed_ids: list[str] = []
+    _current_video_id: str = ""
     n_challenge_failed = False
 
     def _append_downloaded_line(one_line: str, *, log_done: bool = False):
@@ -1346,17 +1614,25 @@ def _download_youtube_to_output_dir_by_ytdlp(
         s = one_line.strip()
         if not s:
             return
+        if s.startswith("[") or s.startswith("WARNING") or s.startswith("Deleting"):
+            return
         p = Path(s)
+        suf = p.suffix.lower()
+        if suf not in VIDEO_EXTS:
+            return
         if not p.exists():
             return
-        k = str(p.resolve()).casefold()
+        try:
+            k = str(p.resolve()).casefold()
+        except OSError:
+            k = str(p).casefold()
         if k in seen:
             return
         seen.add(k)
         done_count += 1
-        downloaded.append(p.resolve())
         if log_done:
             self._log(f"[yt-dlp] 下载完成: {p.name}")
+        downloaded.append(p)
 
     try:
         if allow_playlist:
@@ -1404,7 +1680,10 @@ def _download_youtube_to_output_dir_by_ytdlp(
                         continue
                     if s.startswith("__YT_START__:"):
                         start_count += 1
-                        self._log(f"[yt-dlp] 正在下载: {s.split(':', 1)[1].strip()}")
+                        _title_part = s.split(":", 1)[1].strip()
+                        self._log(f"[yt-dlp] 正在下载: {_title_part}")
+                        _id_m = re.search(r'\[([A-Za-z0-9_-]{11})\]\s*$', _title_part)
+                        _current_video_id = _id_m.group(1) if _id_m else ""
                         continue
                     _append_downloaded_line(s, log_done=True)
                 else:
@@ -1431,6 +1710,9 @@ def _download_youtube_to_output_dir_by_ytdlp(
                             fmt_m = re.search(r'\[(?:\w+)\]\s+(\S+?):', s)
                             if fmt_m:
                                 format_failed_ids.append(fmt_m.group(1))
+                        if "aria2c exited with code" in low and _current_video_id:
+                            if _current_video_id not in aria2c_failed_ids:
+                                aria2c_failed_ids.append(_current_video_id)
             proc.wait()
             stdout_text = "".join(stdout_lines)
             stderr_text = "".join(stderr_lines)
@@ -1493,6 +1775,47 @@ def _download_youtube_to_output_dir_by_ytdlp(
                             self._log(f"[yt-dlp] 回退异常 [{vid}]: {exc}")
                     if not retried_ok:
                         self._log(f"[yt-dlp] [{vid}] 所有回退格式均失败")
+            if aria2c_failed_ids:
+                _already_done = {str(p.stem).casefold() for p in downloaded}
+                _aria2c_todo = [v for v in aria2c_failed_ids if v.lower() not in _already_done]
+                if _aria2c_todo:
+                    self._log(f"[yt-dlp] 有 {len(_aria2c_todo)} 个视频因 aria2c 失败，回退到内置下载器重试…")
+                    _a2_retry_base = list(cmd_prefix) + [
+                        "--no-playlist", "--print", "after_move:filepath", "--quiet",
+                        "--embed-metadata", "--embed-thumbnail",
+                        "--retries", "8", "--fragment-retries", "8",
+                        "--concurrent-fragments", "4",
+                        "--http-chunk-size", "10M",
+                        "--download-archive", str(archive_path),
+                        "-o", out_tpl,
+                    ]
+                    if has_ffmpeg:
+                        _a2_retry_base.extend(["--merge-output-format", "mp4", "--remux-video", "mp4"])
+                    _a2_retry_base.extend(self._ytdlp_js_runtime_args())
+                    _a2_retry_base.extend(self._ytdlp_impersonate_args())
+                    if has_ffmpeg:
+                        _a2_retry_base.extend(["-f", "bestvideo*+bestaudio/best"])
+                    if cookie_source:
+                        _a2_retry_base.extend(["--cookies-from-browser", cookie_source])
+                    for vid in _aria2c_todo:
+                        retry_url = f"https://www.youtube.com/watch?v={vid}"
+                        self._log(f"[yt-dlp] aria2c 回退重试 [{vid}] 内置下载器")
+                        try:
+                            rp = subprocess.run(
+                                _a2_retry_base + [retry_url],
+                                capture_output=True, text=False, check=False,
+                                env=self._ytdlp_subprocess_env(), timeout=600,
+                            )
+                            before_cnt = len(downloaded)
+                            for rl in _decode_subprocess_text(rp.stdout or b"").splitlines():
+                                _append_downloaded_line(rl.strip(), log_done=True)
+                            if len(downloaded) > before_cnt:
+                                fail_count = max(0, fail_count - 1)
+                            elif rp.returncode != 0:
+                                retry_err = _decode_subprocess_text(rp.stderr or b"").strip()
+                                self._log(f"[yt-dlp] 内置下载器也失败 [{vid}]: {retry_err[:300]}")
+                        except Exception as exc:
+                            self._log(f"[yt-dlp] 回退异常 [{vid}]: {exc}")
             if n_challenge_failed:
                 self._log(
                     "[yt-dlp] 提示: YouTube n challenge 解析失败可能导致部分视频无法下载。"
@@ -1523,24 +1846,33 @@ def _download_youtube_to_output_dir_by_ytdlp(
         return []
 
     if not downloaded:
-        candidates = sorted(
-            [p for p in output_dir.glob("*") if p.is_file() and p.suffix.lower() in VIDEO_EXTS],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        for one in candidates:
-            if one.stat().st_mtime < (start_ts - 2.0):
-                continue
-            k = str(one.resolve()).casefold()
-            if k in seen:
-                continue
-            seen.add(k)
-            downloaded.append(one.resolve())
-            done_count += 1
-            if not allow_playlist:
-                break
+        _FRAG_RE = re.compile(r'\.f\d+\.(?:mp4|webm|m4a|mp3|ogg|opus|flac|wav)$', re.IGNORECASE)
+        try:
+            with os.scandir(str(output_dir)) as it:
+                for ent in it:
+                    if not ent.is_file(follow_symlinks=False):
+                        continue
+                    _name = ent.name
+                    if _name.endswith(".part") or _name.endswith(".ytdl"):
+                        continue
+                    if _FRAG_RE.search(_name):
+                        continue
+                    if Path(_name).suffix.lower() not in VIDEO_EXTS:
+                        continue
+                    st = ent.stat(follow_symlinks=False)
+                    if st.st_mtime < (start_ts - 2.0):
+                        continue
+                    k = ent.path.casefold()
+                    if k in seen:
+                        continue
+                    seen.add(k)
+                    downloaded.append(Path(ent.path))
+                    done_count += 1
+                    if not allow_playlist:
+                        break
+        except OSError:
+            pass
     if downloaded:
-        downloaded.sort(key=lambda p: p.stat().st_mtime)
         if allow_playlist:
             self._log(
                 f"[yt-dlp] 播放列表下载统计: 开始={start_count} 完成={done_count} 跳过={skip_count} 失败={fail_count}"
@@ -1550,6 +1882,179 @@ def _download_youtube_to_output_dir_by_ytdlp(
     self._last_ytdlp_need_cookie = self._is_ytdlp_need_cookie_error(err_text)
     self._last_ytdlp_error = (err_text or "未知错误")[:800]
     self._log(f"[yt-dlp] 下载失败: {self._last_ytdlp_error}")
+    return []
+
+
+def _download_twitter_profile_by_gallery_dl(
+    self,
+    url: str,
+    output_dir: Path,
+    cookie_source: str | None = None,
+    root_title: str = "",
+) -> list[Path]:
+    """Use gallery-dl to batch-download videos from a Twitter/X user profile."""
+    self._last_ytdlp_error = ""
+    self._last_ytdlp_need_cookie = False
+
+    # WebView2 encrypts cookies with its own key; gallery-dl cannot decrypt
+    # them via --cookies-from-browser.  Export to Netscape cookie file instead.
+    cookie_file: str | None = None
+    try:
+        cookie_file = self._export_webview2_cookies_to_file()
+        if cookie_file:
+            self._log("[gallery-dl] WebView2 cookies 已导出。")
+    except Exception as exc:
+        self._log(f"[gallery-dl] cookie 导出失败: {exc}")
+
+    gdl_prefix = self._gallery_dl_cmd_prefix()
+    if not gdl_prefix:
+        self._last_ytdlp_error = "未找到 gallery-dl，请先安装：pip install gallery-dl"
+        self._log(f"[gallery-dl] {self._last_ytdlp_error}")
+        return []
+
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    root_title_clean = re.sub(r'[\\/:*?"<>|]+', "", str(root_title or "").strip()) or "未命名"
+    if len(root_title_clean) > 60:
+        root_title_clean = root_title_clean[:60]
+
+    # SQLite archive MUST be on a local disk; SMB + SQLite = deadlock.
+    _local_archive_dir = Path(os.environ.get("LOCALAPPDATA", "")) / "gallery-dl-archives"
+    _local_archive_dir.mkdir(parents=True, exist_ok=True)
+    _archive_name = re.sub(r'[\\/:*?"<>|]+', "_", str(output_dir)) + ".sqlite3"
+    archive_path = _local_archive_dir / _archive_name
+    filename_tpl = (
+        "[" + root_title_clean + "]"
+        "[{date:%Y-%m-%d}] {tweet_id}_{num}.{extension}"
+    )
+
+    use_url = self._normalize_video_download_url(url) or (url or "").strip()
+    parsed = urlparse(use_url)
+    path_part = (parsed.path or "").rstrip("/")
+    if not re.search(r"/status/\d+", path_part) and not path_part.endswith("/media"):
+        use_url = parsed._replace(path=path_part + "/media").geturl()
+
+    VIDEO_FILTER = "extension in ('mp4', 'webm', 'mkv', 'ts', 'm4v')"
+    base_opts = [
+        "--filter", VIDEO_FILTER,
+        "-d", str(output_dir),
+        "-o", "directory=",
+        "-o", "filename=" + filename_tpl,
+    ]
+
+    # ---- file listing ----
+    filenames_list_path = output_dir / ".gallery-dl-filenames.txt"
+    list_cmd = [*gdl_prefix, "--simulate", *base_opts]
+    if cookie_file:
+        list_cmd.extend(["--cookies", cookie_file])
+    elif cookie_source:
+        list_cmd.extend(["--cookies-from-browser", cookie_source])
+    list_cmd.append(use_url)
+    self._log("[gallery-dl] 正在获取文件名列表…")
+    try:
+        list_proc = subprocess.run(
+            list_cmd, capture_output=True, text=True, check=False, timeout=120,
+        )
+        fn_lines = [ln.strip() for ln in (list_proc.stdout or "").splitlines() if ln.strip()]
+        if fn_lines:
+            with open(filenames_list_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(fn_lines) + "\n")
+            self._log(f"[gallery-dl] 文件名列表已写入 {filenames_list_path.name} ({len(fn_lines)} 条)")
+        else:
+            self._log("[gallery-dl] 文件名列表为空（无可用视频条目）")
+    except subprocess.TimeoutExpired:
+        self._log("[gallery-dl] 获取文件名列表超时，跳过，继续下载…")
+    except Exception as exc:
+        self._log(f"[gallery-dl] 获取文件名列表失败: {exc}，继续下载…")
+
+    # ---- actual download ----
+    start_ts = time.time()
+
+    cmd = [*gdl_prefix, *base_opts, "--download-archive", str(archive_path), "--no-mtime"]
+    if cookie_file:
+        cmd.extend(["--cookies", cookie_file])
+    elif cookie_source:
+        cmd.extend(["--cookies-from-browser", cookie_source])
+    cmd.append(use_url)
+
+    self._log(f"[gallery-dl] 开始下载: {use_url}")
+    downloaded: list[Path] = []
+    stdout_text = ""
+    stderr_text = ""
+    _VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".ts", ".m4v", ".avi", ".mov"}
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        q: queue.Queue[tuple[str, str | None]] = queue.Queue()
+
+        def _reader(pipe, tag):
+            try:
+                for line in pipe:
+                    q.put((tag, line))
+            finally:
+                q.put((tag, None))
+
+        t_out = threading.Thread(target=_reader, args=(proc.stdout, "out"), daemon=True)
+        t_err = threading.Thread(target=_reader, args=(proc.stderr, "err"), daemon=True)
+        t_out.start()
+        t_err.start()
+        ended = {"out": False, "err": False}
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+        seen: set[str] = set()
+        while not all(ended.values()):
+            try:
+                tag, line = q.get(timeout=0.5)
+            except queue.Empty:
+                if proc.poll() is not None and not t_out.is_alive() and not t_err.is_alive():
+                    break
+                continue
+            if line is None:
+                ended[tag] = True
+                continue
+            s = line.rstrip()
+            if tag == "out":
+                out_lines.append(s)
+                if not s:
+                    continue
+                p = Path(s)
+                if p.suffix.lower() in _VIDEO_EXTS:
+                    k = s.casefold()
+                    if k not in seen:
+                        seen.add(k)
+                        downloaded.append(p)
+                        self._log(f"[gallery-dl] 下载完成: {p.name}")
+                        continue
+                if not s.startswith("#"):
+                    self._log(f"[gallery-dl] {s[:300]}")
+            else:
+                err_lines.append(s)
+                if s:
+                    self._log(f"[gallery-dl] {s[:300]}")
+        proc.wait()
+        stdout_text = "\n".join(out_lines)
+        stderr_text = "\n".join(err_lines)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        self._last_ytdlp_error = "gallery-dl 下载超时"
+        self._log("[gallery-dl] 下载超时")
+        return []
+    except Exception as exc:
+        self._last_ytdlp_error = str(exc)
+        self._log(f"[gallery-dl] 下载异常: {exc}")
+        return []
+
+    elapsed = time.time() - start_ts
+    if downloaded:
+        self._log(f"[gallery-dl] 完成，下载 {len(downloaded)} 个视频，耗时 {elapsed:.1f}s")
+        return downloaded
+
+    all_text = (stderr_text + "\n" + stdout_text).strip()
+    self._last_ytdlp_need_cookie = self._is_twitter_need_cookie_error(all_text)
+    self._last_ytdlp_error = (all_text or "未知错误")[:800]
+    self._log(f"[gallery-dl] 下载失败: {self._last_ytdlp_error}")
     return []
 
 
@@ -1593,28 +2098,45 @@ def _download_video_to_nfo_dir_via_webview(self, nfo_path: Path):
         else "https://www.youtube.com/"
     )
     tip = (
-        "请在弹出的 WebView2 中选择要下载的视频页面或播放列表页面。\n"
-        "支持 playlist 批量下载；确认后会下载到当前 NFO 所在目录。"
+        "请在弹出的 WebView2 中选择要下载的视频页面。\n"
+        "支持 YouTube 视频/播放列表 和 Twitter/X 用户主页（批量下载所有视频）。\n"
+        "确认后会下载到当前 NFO 所在目录。"
     )
+
+    def _is_valid_download_url(confirmed: str) -> bool:
+        if self._is_youtube_url(confirmed):
+            parsed = urlparse(confirmed)
+            is_v = ("/watch" in parsed.path) or ("youtu.be/" in confirmed)
+            q = parse_qs(parsed.query or "")
+            is_pl = ("/playlist" in parsed.path) or ("list" in q and bool((q.get("list") or [""])[0].strip()))
+            return is_v or is_pl
+        if self._is_twitter_url(confirmed):
+            parts = (urlparse(confirmed).path or "").strip("/").split("/")
+            skip = {"i","search","explore","settings","home","notifications","messages","compose","login","signup",""}
+            return bool(parts and parts[0].lower() not in skip)
+        return False
 
     def _start_download(cookie_source: str):
         confirmed = str(getattr(self, "_last_confirmed_video_url", "") or "").strip() or open_url
-        if not self._is_youtube_url(confirmed):
-            QMessageBox.warning(self, "链接无效", "请在 WebView2 中打开 YouTube 视频页或播放列表页后再确认。")
+        if not _is_valid_download_url(confirmed):
+            QMessageBox.warning(self, "链接无效", "请打开 YouTube 视频/播放列表 或 Twitter/X 用户主页后再确认。")
             return
-        parsed = urlparse(confirmed)
-        is_video_page = ("/watch" in parsed.path) or ("youtu.be/" in confirmed)
-        q = parse_qs(parsed.query or "")
-        is_playlist_page = ("/playlist" in parsed.path) or ("list" in q and bool((q.get("list") or [""])[0].strip()))
-        if (not is_video_page) and (not is_playlist_page):
+        is_tw_profile = self._is_twitter_profile_url(confirmed)
+        tag = "gallery-dl" if is_tw_profile else "yt-dlp"
+        if 0:
             QMessageBox.warning(self, "链接无效", "请在 WebView2 中打开具体视频页或 playlist 页后，再点“确认并继续”。")
             return
-        self._log(f"[yt-dlp] NFO右键下载开始: {confirmed} -> {output_dir}")
+        self._log(f"[{tag}] NFO右键下载开始: {confirmed} -> {output_dir}")
 
         def _job():
+            if is_tw_profile:
+                return self._download_twitter_profile_by_gallery_dl(
+                    confirmed, output_dir,
+                    cookie_source=cookie_source,
+                    root_title=keyword,
+                )
             return self._download_youtube_to_output_dir_by_ytdlp(
-                confirmed,
-                output_dir,
+                confirmed, output_dir,
                 cookie_source=cookie_source,
                 allow_playlist=True,
                 root_title=keyword,
@@ -1623,19 +2145,26 @@ def _download_video_to_nfo_dir_via_webview(self, nfo_path: Path):
         def _done(paths_obj, err):
             paths = [p for p in (paths_obj or []) if isinstance(p, Path)] if isinstance(paths_obj, list) else []
             if err:
-                self._log(f"[yt-dlp] NFO右键下载异常: {err}")
+                self._log(f"[{tag}] NFO右键下载异常: {err}")
             if not paths:
                 if self._last_ytdlp_need_cookie:
                     self._prompt_chromium_login_cookie_async(
                         confirmed,
                         "请在 WebView2 中完成 YouTube 登录后，再点击“确认并继续”。",
                         lambda retry_cookie: self._run_async(
-                            lambda: self._download_youtube_to_output_dir_by_ytdlp(
-                                confirmed,
-                                output_dir,
-                                cookie_source=retry_cookie,
-                                allow_playlist=True,
-                                root_title=keyword,
+                            lambda: (
+                                self._download_twitter_profile_by_gallery_dl(
+                                    confirmed, output_dir,
+                                    cookie_source=retry_cookie,
+                                    root_title=keyword,
+                                )
+                                if is_tw_profile
+                                else self._download_youtube_to_output_dir_by_ytdlp(
+                                    confirmed, output_dir,
+                                    cookie_source=retry_cookie,
+                                    allow_playlist=True,
+                                    root_title=keyword,
+                                )
                             ),
                             _done,
                         )
@@ -2447,6 +2976,9 @@ def bind_network_services_methods(cls):
     cls._download_binary_from_url = _download_binary_from_url
     cls._is_youtube_url = _is_youtube_url
     cls._is_twitter_url = _is_twitter_url
+    cls._is_twitter_profile_url = _is_twitter_profile_url
+    cls._gallery_dl_cmd_prefix = _gallery_dl_cmd_prefix
+    cls._export_webview2_cookies_to_file = _export_webview2_cookies_to_file
     cls._normalize_video_download_url = _normalize_video_download_url
     cls._is_ytdlp_need_cookie_error = _is_ytdlp_need_cookie_error
     cls._is_cookie_decrypt_error = _is_cookie_decrypt_error
@@ -2475,6 +3007,7 @@ def bind_network_services_methods(cls):
     cls._resolve_search_keyword = _resolve_search_keyword
     cls._open_video_search_dialog = _open_video_search_dialog
     cls._download_youtube_to_output_dir_by_ytdlp = _download_youtube_to_output_dir_by_ytdlp
+    cls._download_twitter_profile_by_gallery_dl = _download_twitter_profile_by_gallery_dl
     cls._download_video_to_nfo_dir_via_webview = _download_video_to_nfo_dir_via_webview
     cls._open_season_renamer_for_nfo = _open_season_renamer_for_nfo
     cls._open_season_episode_offset_dialog = _open_season_episode_offset_dialog
