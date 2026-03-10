@@ -2168,7 +2168,6 @@ class MultiValueEditor(QWidget):
         self.shell.installEventFilter(self)
         root.addWidget(self.shell)
         self.setMinimumHeight(24)
-        self.setMaximumHeight(48)
         self._rebuild_flow()
 
     def _create_input_edit(self) -> QLineEdit:
@@ -2208,6 +2207,7 @@ class MultiValueEditor(QWidget):
             return False
         if obj is self.shell and event.type() == QEvent.Resize:
             self._position_input_overlay()
+            self._adjust_height()
             return False
         if obj is self.input_edit:
             if event.type() == QEvent.FocusOut:
@@ -2334,6 +2334,19 @@ class MultiValueEditor(QWidget):
         self._sync_input_width()
         self._set_selected_index(self._selected_index if 0 <= self._selected_index < len(self._values) else -1)
         QTimer.singleShot(0, self._position_input_overlay)
+        QTimer.singleShot(0, self._adjust_height)
+
+    def _adjust_height(self):
+        w = self.shell.width() or self.width()
+        if w <= 0:
+            return
+        needed = self.flow.heightForWidth(w)
+        m = self.shell.contentsMargins()
+        total = needed + m.top() + m.bottom() + self.layout().contentsMargins().top() + self.layout().contentsMargins().bottom()
+        total = max(24, total + 2)
+        if self.maximumHeight() != total or self.minimumHeight() != total:
+            self.setFixedHeight(total)
+            self.updateGeometry()
 
     def _position_input_overlay(self):
         self._ensure_input_edit_alive()
@@ -2527,7 +2540,7 @@ class JellyfinNfoQtWindow(QMainWindow):
         self.items: list[NfoItem] = []
         self.field_edits: dict[str, QLineEdit] = {}
         self.multi_value_editors: dict[str, MultiValueEditor] = {}
-        self.plot_edit: QTextEdit | None = None
+        self.plot_edit: QPlainTextEdit | None = None
         self._history_file = Path(__file__).with_name(".jellyfin_ops_history.json")
         self._session_pg_dsn = ""
         self._session_pg_key = "default"
@@ -3526,12 +3539,15 @@ class JellyfinNfoQtWindow(QMainWindow):
             self._suspend_selection_change_prompt = False
         return True
 
-    def _delete_removed_media_for_item(self, item: NfoItem, ui_target_paths: dict[str, set[str]]):
+    def _delete_removed_media_for_item(self, item: NfoItem, ui_target_paths: dict[str, set[str]],
+                                       uploaded_targets: set[str] | None = None):
         existing = self._scan_existing_media_for_item(item)
         controlled_targets = set(self.image_source_edits) | set(self.extra_image_source_edits) | set(self.extra_video_source_edits) | set(
             self.extra_audio_source_edits
         )
         for target in controlled_targets:
+            if uploaded_targets and target in uploaded_targets:
+                continue
             wanted = ui_target_paths.get(target, set())
             wanted_names = {Path(x).name.casefold() for x in wanted if x}
             for p in existing.get(target, []):
@@ -3649,32 +3665,38 @@ class JellyfinNfoQtWindow(QMainWindow):
         skipped_aggregated: list[str] = []
         for tag, w in self.field_edits.items():
             value = w.text().strip()
+            old_value = self._loaded_field_snapshot.get(tag, "")
             if not value:
+                if old_value:
+                    edits[tag] = ""
                 continue
             if tag not in MULTI_VALUE_TAGS and " | " in value:
                 skipped_aggregated.append(tag)
                 continue
-            old_value = self._loaded_field_snapshot.get(tag, "")
             if value == old_value:
                 continue
             edits[tag] = value
         for tag, mv in self.multi_value_editors.items():
             values = mv.get_values()
+            old_value = self._loaded_field_snapshot.get(tag, "")
             if not values:
+                if old_value:
+                    edits[tag] = ""
                 continue
             value = "/".join(values)
-            old_value = self._loaded_field_snapshot.get(tag, "")
             if value == old_value:
                 continue
             edits[tag] = value
         if self.plot_edit is not None:
             plot_value = self.plot_edit.toPlainText().strip()
-            if plot_value and "\n\n-----\n\n" not in plot_value:
-                old_plot = self._loaded_field_snapshot.get("plot", "")
-                if plot_value != old_plot:
-                    edits["plot"] = plot_value
-            elif plot_value and "\n\n-----\n\n" in plot_value:
+            old_plot = self._loaded_field_snapshot.get("plot", "")
+            if not plot_value:
+                if old_plot:
+                    edits["plot"] = ""
+            elif "\n\n-----\n\n" in plot_value:
                 skipped_aggregated.append("plot")
+            elif plot_value != old_plot:
+                edits["plot"] = plot_value
         if skipped_aggregated:
             self._log(f"提示: 以下字段为聚合展示值，未参与写入: {', '.join(sorted(set(skipped_aggregated)))}")
 
@@ -3791,12 +3813,13 @@ class JellyfinNfoQtWindow(QMainWindow):
                         actual_edits = dict(merged_edits)
                     if actual_edits:
                         write_nfo_fields(item.path, actual_edits)
-                self._delete_removed_media_for_item(item, ui_target_paths)
                 for kind, src in image_sources.items():
                     apply_artwork_files(item.path, src, None, thumb_kind=kind)
                 self._apply_extra_uploads(item.path, extra_image_uploads)
                 self._apply_extra_uploads(item.path, extra_video_uploads)
                 self._apply_extra_uploads(item.path, extra_audio_uploads)
+                _just_uploaded = set(image_sources) | set(extra_image_uploads) | set(extra_video_uploads) | set(extra_audio_uploads)
+                self._delete_removed_media_for_item(item, ui_target_paths, _just_uploaded)
                 ok += 1
                 self._log(f"写入成功: {item.path}")
             except Exception as exc:
