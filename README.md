@@ -50,12 +50,14 @@ pip install pyside6
 
 ### 2.2 可选环境（强烈建议）
 
-#### A. 视频下载增强（yt-dlp）
+#### A. 视频下载增强（yt-dlp + gallery-dl）
 
-- `yt-dlp`：用于下载 YouTube/Twitter(X) 等页面视频
+- `yt-dlp`：用于下载 YouTube 视频/播放列表及单条推文
+- `gallery-dl`：用于下载 Twitter/X 用户主页下的全部视频（yt-dlp 不支持用户主页批量）
 
 ```powershell
 pip install -U yt-dlp
+pip install -U gallery-dl
 ```
 
 #### B. 高画质合并/转码（FFmpeg）
@@ -73,7 +75,7 @@ winget install Gyan.FFmpeg
 
 #### C. 下载加速（aria2，可选）
 
-- `aria2c`：若存在会被自动用于 yt-dlp 并发下载加速
+- `aria2c`：若存在会被自动用于 yt-dlp 并发下载；若某视频 aria2c 失败，会自动用 yt-dlp 内置下载器重试
 
 ```powershell
 winget install aria2.aria2
@@ -111,6 +113,8 @@ pip install windnd
 
 ```powershell
 pip install -U pyside6 yt-dlp pillow pywebview
+# 若需从 X（Twitter）用户主页批量下载视频，可额外安装：
+# pip install -U gallery-dl
 ```
 
 并确保：
@@ -159,7 +163,10 @@ pip install pyside6
   NFO 扫描/解析/写回核心能力。
 
 - `season_renamer_ui.py`  
-  提供季批量重命名核心函数（当前仍被 `jellyfin_nfo_qt_services.py` 引用）。
+  季批量重命名核心（被主程序引用）；也可独立运行，支持后台线程执行、同步重命名视频与同名 NFO。
+
+- `tag.py`  
+  标签分析工具：扫描目录内视频文件名与 `.yt-dlp-filenames.txt`，按关键词映射输出标签；支持 GUI 与命令行。
 
 - `jellyfin_nfo_qt_webview2_helper.py`  
   登录确认窗口 helper（pywebview）。
@@ -183,15 +190,15 @@ pip install pyside6
 ### 5.3 视频下载到 NFO 目录
 
 - NFO 右键可发起下载
-- 支持 YouTube 视频页与播放列表链接
-- 下载命名、metadata/thumbnail 嵌入、cookie 登录重试等流程已集成
-- 若系统存在 `aria2c` 将自动启用加速参数
+- **YouTube**：视频页、播放列表（yt-dlp）；支持 aria2c 加速，失败时自动回退到内置下载器
+- **Twitter/X**：用户主页批量下载使用 gallery-dl；单条推文可用 yt-dlp
+- 下载命名、metadata/缩略图嵌入、Cookie 登录重试已集成；存档与暂存目录在本地（`%LOCALAPPDATA%`），避免网络盘卡顿
 
 ### 5.4 季批量重命名与季度偏移
 
-- 支持季/集规则修正（`SxEx`）
-- 支持季号/集号偏移与目标冲突检查
-- 支持处理预览与执行前确认
+- 季批量重命名会同时重命名视频文件与同名 NFO，且统一将季集标识规范为大写（如 `S03E001`）
+- 大量文件时在后台线程执行，避免界面卡死
+- 支持季号/集号偏移与目标冲突检查、执行前预览与确认
 
 ### 5.5 图表模式与列表模式
 
@@ -233,19 +240,35 @@ pip install pywebview
 ### Q5: 可以删除 `season_renamer_ui.py` 吗？
 
 当前**不可以直接删除**。  
-`jellyfin_nfo_qt_services.py` 仍在导入其中的重命名核心函数，删除会导致导入失败。
+主程序仍在导入其中的重命名核心函数，删除会导致导入失败。
+
+### Q6: X（Twitter）用户主页下载失败，提示需登录或找不到 gallery-dl
+
+- 用户主页批量下载依赖 `gallery-dl`，请安装：`pip install -U gallery-dl`
+- 若提示需要 Cookie，在工具内按提示使用「Twitter/X 登录」流程后再试
+
+### Q7: 标签工具 `tag.py` 怎么用？
+
+- **GUI**：`python tag.py` 或 `python tag.py <目录路径>`，可选路径后点扫描，结果可复制
+- **命令行**：`python tag.py --cli <目录路径>` 输出到控制台
 
 ---
 
 ## 7. 运行时生成的缓存/状态文件
 
-常见运行时文件（可按需清理）：
+**项目目录下（可按需清理）：**
 
 - `.nfo_image_cache/`：下载或处理中间图片缓存
 - `.nfo_video_cache/`：下载或处理中间视频缓存
 - `.nfo_extra_cache/`：额外资源缓存
-- `.jellyfin_qt_session.json`：会话状态
-- `.season_renamer_history.json`：重命名历史
+- `.season_renamer_history.json`：季重命名历史（仅当使用季重命名时）
+
+**本地应用数据目录（`%LOCALAPPDATA%`）：**
+
+- `jellyfin-nfo-tools\.jellyfin_qt_session.sqlite3`：会话与扫描缓存（避免网络盘锁表）
+- `yt-dlp-archives/`：yt-dlp 下载存档（按根目录区分，避免重复下载）
+- `gallery-dl-archives/`：gallery-dl 下载存档（X 用户主页去重用）
+- `bgutil_pot_server/`：YouTube POT 认证服务（若使用 yt-dlp 的 POT 插件时自动创建）
 
 > 清理缓存前建议先关闭程序，避免并发读写。
 
